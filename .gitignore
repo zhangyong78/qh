@@ -1,0 +1,7 @@
+tools/dotnet/
+data/
+artifacts/
+bin/
+obj/
+*.user
+*.suo

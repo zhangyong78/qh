@@ -1,0 +1,3 @@
+timestamp,symbol,exchange,period,trading_day,open,high,low,close,volume,open_interest,is_complete
+2026-10-01T09:00:00+08:00,rb2601,SHFE,1m,2026-10-01,3220,3230,3215,3225,210,5030,true
+2026-10-01T09:01:00+08:00,au2601,SHFE,1m,2026-10-01,700,705,699,703,10,300,true

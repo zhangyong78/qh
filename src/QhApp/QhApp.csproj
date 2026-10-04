@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Platforms>x64</Platforms>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Qh.Core\Qh.Core.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="..\..\worker\qh_worker.py" Link="worker\qh_worker.py" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\worker\qh_signal_worker.py" Link="worker\qh_signal_worker.py" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\worker\qh_tqsdk_bridge.py" Link="worker\qh_tqsdk_bridge.py" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\strategies\sma_ema_cross.py" Link="strategies\sma_ema_cross.py" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\strategies\trade_sequence.py" Link="strategies\trade_sequence.py" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\strategies\sma_ema_cross_trade.py" Link="strategies\sma_ema_cross_trade.py" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\strategies\same_bar_open_close.py" Link="strategies\same_bar_open_close.py" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\strategies\warmup10_trade.py" Link="strategies\warmup10_trade.py" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\strategies\perf_zero_trade.py" Link="strategies\perf_zero_trade.py" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\strategies\trade_init_hang.py" Link="strategies\trade_init_hang.py" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\strategies\trade_timeout.py" Link="strategies\trade_timeout.py" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\strategies\high_frequency_trade.py" Link="strategies\high_frequency_trade.py" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

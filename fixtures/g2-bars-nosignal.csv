@@ -1,0 +1,6 @@
+timestamp,symbol,exchange,period,trading_day,open,high,low,close,volume,open_interest,is_complete
+2026-10-01T09:00:00+08:00,TEST,TEST,1m,2026-10-01,14,14.2,13.8,14,1,1,true
+2026-10-01T09:01:00+08:00,TEST,TEST,1m,2026-10-01,14,14.2,12.8,13,1,1,true
+2026-10-01T09:02:00+08:00,TEST,TEST,1m,2026-10-01,13,13.2,11.8,12,1,1,true
+2026-10-01T09:03:00+08:00,TEST,TEST,1m,2026-10-01,12,12.2,10.8,11,1,1,true
+2026-10-01T09:04:00+08:00,TEST,TEST,1m,2026-10-01,11,11.2,9.8,10,1,1,true

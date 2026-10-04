@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <QhCorePath Condition="'$(QhCorePath)' == ''">$(MSBuildThisFileDirectory)..\..\src\Qh.Core\bin\Release\net10.0\Qh.Core.dll</QhCorePath>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="Qh.Core"><HintPath>$(QhCorePath)</HintPath></Reference>
+  </ItemGroup>
+</Project>
