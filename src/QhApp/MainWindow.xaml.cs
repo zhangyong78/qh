@@ -933,15 +933,16 @@ public partial class MainWindow : Window
         var card = fileName switch
         {
             "sma_ema_cross_trade.py" => ("快慢均线交叉时产生开仓/反向意图；成交、费用和权益由本地交易回放模拟。", "类型：交易　结果：本地模拟成交、手续费和盈亏"),
+            "ema_dynamic_long_trade.py" => ("EMA 趋势成立后按 EMA 参考价挂多头限价单；未触及的订单逐根撤销重挂，止损与动态保本按下一根有效 K 线开盘模拟。", "类型：交易　限价触发＋本地模拟成交、手续费和盈亏"),
             "period_signal.py" => ("指标预热完成后产生测试信号，适合检查数据、预热和回放链路。", "类型：信号　结果：只看信号，不生成成交和盈亏"),
             _ => ("快慢均线交叉时产生做多/做空信号；只做信号研究，不产生成交。", "类型：信号　结果：只看信号，不生成成交和盈亏")
         };
         StrategyCardText.Text = card.Item1;
         StrategyCardMetaText.Text = card.Item2;
-        StrategyRunMeaningText.Text = fileName == "sma_ema_cross_trade.py"
+        StrategyRunMeaningText.Text = fileName is "sma_ema_cross_trade.py" or "ema_dynamic_long_trade.py"
             ? "交易策略：会进入本地模拟成交，并计算手续费、净利和权益；不会向真实账户下单。"
             : "信号策略：只产生研究信号，不产生成交、手续费或盈亏。";
-        SetBacktestButtonKind(fileName == "sma_ema_cross_trade.py");
+        SetBacktestButtonKind(fileName is "sma_ema_cross_trade.py" or "ema_dynamic_long_trade.py");
     }
 
     private void UpdateStrategyCardFromDescriptor()
@@ -967,11 +968,15 @@ public partial class MainWindow : Window
     private void SyncStrategyPresetSelectionToDescriptor()
     {
         if (_strategyDescriptor is null || StrategyPresetCombo is null) return;
-        var targetIndex = string.Equals(_strategyDescriptor.Kind, "trade", StringComparison.OrdinalIgnoreCase) ? 1 : 0;
-        if (StrategyPresetCombo.SelectedIndex == targetIndex) return;
+        var strategyFileName = Path.GetFileName(_strategyDescriptor.StrategyPath);
+        var targetItem = StrategyPresetCombo.Items.OfType<ComboBoxItem>()
+            .FirstOrDefault(item => string.Equals(item.Tag?.ToString(), strategyFileName, StringComparison.OrdinalIgnoreCase));
+        if (targetItem is null && string.Equals(_strategyDescriptor.Kind, "trade", StringComparison.OrdinalIgnoreCase))
+            targetItem = StrategyPresetCombo.Items.OfType<ComboBoxItem>().FirstOrDefault(item => item.Tag?.ToString() == "sma_ema_cross_trade.py");
+        if (targetItem is null || ReferenceEquals(StrategyPresetCombo.SelectedItem, targetItem)) return;
         var previous = _restoringRunView;
         _restoringRunView = true;
-        try { StrategyPresetCombo.SelectedIndex = targetIndex; }
+        try { StrategyPresetCombo.SelectedItem = targetItem; }
         finally { _restoringRunView = previous; }
     }
 
@@ -1249,7 +1254,7 @@ public partial class MainWindow : Window
             _strategyParameterTextBoxes.Clear();
             _strategyParameterComboBoxes.Clear();
             var selectedFile = (StrategyPresetCombo?.SelectedItem as ComboBoxItem)?.Tag?.ToString();
-            SetBacktestButtonKind(selectedFile == "sma_ema_cross_trade.py");
+            SetBacktestButtonKind(selectedFile is "sma_ema_cross_trade.py" or "ema_dynamic_long_trade.py");
             StrategyParameterFormHint.Text = "加载策略后显示参数默认值和范围。";
             ClearSignalContext();
             SetStatus(message);

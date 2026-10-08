@@ -285,6 +285,7 @@ public sealed class TradeReplayRunner
         var result = intent.Action switch
         {
             "open" => state.Open(intent, bar, barEnd, config, directory),
+            "open_limit" => state.OpenLimit(intent, bar, barEnd, config, directory),
             "close" => state.Close(intent, bar, barEnd, config, directory),
             "reverse" => state.Reverse(intent, bar, barEnd, config, directory),
             _ => "unsupported_action"
@@ -469,6 +470,24 @@ public sealed class TradeReplayRunner
             var fee = Fee(price, quantity, true, config, null, bar.TradingDay); var margin = price * config.Multiplier * quantity * config.MarginRate;
             if (EquityAtPrice(price) - fee < margin) { Risk(barEnd, "margin_exceeded", $"开仓保证金 {margin} 超过可用权益，未模拟强平", intent.Sequence); Risk(barEnd, "insufficient_funds", $"需要保证金 {margin} 加费用 {fee}，可用权益不足", intent.Sequence); return "insufficient_funds"; }
             var fill = AddFill(effectiveIntent, barEnd, bar.TradingDay, price, fee, "open", "opened", config, Math.Abs(price - bar.Open), config.FeeMode == TradingFeeMode.Rate ? "rate" : "fixed_open"); _position = new Position(intent.Direction, quantity, price, bar.TradingDay, fill.FillSequence, margin, fee); return "filled";
+        }
+        public string OpenLimit(TradeIntent intent, Bar bar, DateTimeOffset barEnd, TradingConfig config, string directory)
+        {
+            if (_position is not null) return "position_already_open";
+            if (intent.Direction != "long") return "open_limit_long_only";
+            if (intent.ReferencePrice is not { } limitPrice || limitPrice <= 0) return "invalid_limit_price";
+            var quantity = intent.Quantity * config.Lots;
+            var effectiveIntent = intent with { Quantity = quantity };
+            var marketableAtOpen = bar.Open <= limitPrice;
+            if (!marketableAtOpen && bar.Low > limitPrice) return "limit_not_touched";
+            var price = marketableAtOpen ? Math.Min(FillPrice(bar.Open, "open", intent.Direction, config), limitPrice) : limitPrice;
+            if (price <= 0) { Risk(barEnd, "invalid_fill_price", $"限价单成交价 {price} 非法，拒绝成交", intent.Sequence); return "invalid_fill_price"; }
+            var fee = Fee(price, quantity, true, config, null, bar.TradingDay);
+            var margin = price * config.Multiplier * quantity * config.MarginRate;
+            if (EquityAtPrice(price) - fee < margin) { Risk(barEnd, "margin_exceeded", $"限价开仓保证金 {margin} 超过可用权益，未模拟强平", intent.Sequence); Risk(barEnd, "insufficient_funds", $"限价开仓需要保证金 {margin} 加费用 {fee}，可用权益不足", intent.Sequence); return "insufficient_funds"; }
+            var fill = AddFill(effectiveIntent, barEnd, bar.TradingDay, price, fee, "open", "opened", config, Math.Abs(price - (marketableAtOpen ? bar.Open : limitPrice)), config.FeeMode == TradingFeeMode.Rate ? "rate" : "fixed_open");
+            _position = new Position(intent.Direction, quantity, price, bar.TradingDay, fill.FillSequence, margin, fee);
+            return "filled";
         }
         public string Close(TradeIntent intent, Bar bar, DateTimeOffset barEnd, TradingConfig config, string directory)
         {

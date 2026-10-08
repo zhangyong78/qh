@@ -240,8 +240,8 @@ def run(path: str, timeout_seconds: float) -> int:
                     else:
                         warmup_signals += 1
                 if intent is not None:
-                    if not isinstance(intent, dict) or intent.get("action") not in ("open", "close", "reverse"):
-                        error = ValueError("交易意图 action 必须是 open/close/reverse")
+                    if not isinstance(intent, dict) or intent.get("action") not in ("open", "open_limit", "close", "reverse"):
+                        error = ValueError("交易意图 action 必须是 open/open_limit/close/reverse")
                         send({"type": "error", "kind": "runtime", "bar_end": bar_end, **exception_payload(path, error)})
                         return 7
                     if intent.get("direction") not in ("long", "short"):
