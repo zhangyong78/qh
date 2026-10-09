@@ -51,7 +51,7 @@ public partial class App : System.Windows.Application
                     timestamp = DateTimeOffset.UtcNow,
                     elapsed_ms = StartupClock.Elapsed.TotalMilliseconds
                 }), new System.Text.UTF8Encoding(false));
-                _ = RunSelfCheckAsync(window, output);
+                _ = RunSelfCheckAsync(window, output, e.Args.Contains("--final-main-check", StringComparer.OrdinalIgnoreCase));
             }));
             return;
         }
@@ -61,20 +61,34 @@ public partial class App : System.Windows.Application
         var dataRootPath = dataRootArgument >= 0 && dataRootArgument + 1 < e.Args.Length
             ? Path.GetFullPath(e.Args[dataRootArgument + 1]) : null;
         var runId = runArgument >= 0 && runArgument + 1 < e.Args.Length ? e.Args[runArgument + 1] : null;
-        MainWindow = new MainWindow(dataRootPath, autoLoadLatest: runId is null);
+        var mainWindow = new MainWindow(dataRootPath, autoLoadLatest: false);
+        MainWindow = mainWindow;
+        mainWindow.RecordStartupEvent("window-created");
         if (runId is not null)
         {
-            var window = (MainWindow)MainWindow;
-            window.Loaded += async (_, _) => await window.OpenTradeRunAsync(runId);
+            mainWindow.Loaded += async (_, _) => await mainWindow.OpenTradeRunAsync(runId);
         }
-        MainWindow.Show();
+        if (runId is null)
+        {
+            var initialLoadStarted = false;
+            mainWindow.ContentRendered += async (_, _) =>
+            {
+                if (initialLoadStarted) return;
+                initialLoadStarted = true;
+                mainWindow.RecordStartupEvent("content-rendered");
+                await mainWindow.LoadInitialSnapshotAsync();
+            };
+        }
+        mainWindow.Show();
+        mainWindow.RecordStartupEvent("show-returned");
+        if (runId is null) _ = mainWindow.LoadInitialSnapshotAsync();
     }
 
-    private async Task RunSelfCheckAsync(MainWindow window, string output)
+    private async Task RunSelfCheckAsync(MainWindow window, string output, bool finalMain = false)
     {
         try
         {
-            var result = await window.RunInternalSelfCheckAsync(output);
+            var result = finalMain ? await window.RunFinalMainSelfCheckAsync(output) : await window.RunInternalSelfCheckAsync(output);
             Shutdown(result ? 0 : 1);
         }
         catch (Exception ex)

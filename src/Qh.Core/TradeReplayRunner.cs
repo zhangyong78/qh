@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 
 namespace Qh.Core;
 
@@ -34,7 +35,7 @@ public sealed class TradeReplayRunner
         var quality = _dataStore.ReadQualityReport(request.SnapshotId);
         var bars = _dataStore.QuerySnapshot(request.SnapshotId, cancellationToken).Where(bar => bar.Timestamp < request.EndExclusive).ToArray();
         var coverage = SignalReplayRunner.EvaluateCoverage(descriptor, parameters, bars, request.StartInclusive, request.EndExclusive);
-        var contractIssue = ValidateTradeSeries(bars);
+        var contractIssue = ValidateTradeSeries(bars, request.MainContinuousResearch);
         var formalRows = coverage.FormalRows;
         var record = new TradeRunRecord
         {
@@ -42,13 +43,14 @@ public sealed class TradeReplayRunner
             StrategySha256 = descriptor.StrategySha256, StrategySnapshotPath = strategySnapshot, StrategyMetadataJson = descriptor.MetadataJson,
             Parameters = parameters.ToDictionary(pair => pair.Key, pair => pair.Value.Clone(), StringComparer.Ordinal), Config = request.Config,
             StartInclusive = request.StartInclusive, EndExclusive = request.EndExclusive, Explore = request.Explore,
+            MainContinuousResearch = request.MainContinuousResearch,
             DataIncomplete = quality.SuspectedGaps.Count > 0 || quality.IncompleteRows > 0, InputRows = bars.Length, FormalRows = formalRows,
             WarmupBarsRequired = coverage.WarmupBarsRequired, WarmupBarsAvailable = coverage.WarmupBarsAvailable,
             CoverageMessage = coverage.Message, CreatedAt = DateTimeOffset.UtcNow
         };
         _runStore.WriteRecord(runDirectory, record);
         File.WriteAllText(Path.Combine(runDirectory, "quality.json"), JsonSerializer.Serialize(quality, new JsonSerializerOptions { WriteIndented = true }), new UTF8Encoding(false));
-        WriteAssumptions(runDirectory, bars);
+        WriteAssumptions(runDirectory, bars, record);
         if (!request.Explore && (quality.SuspectedGaps.Count > 0 || !quality.CanPublish))
             return await FinishBlockedAsync(record, runDirectory, "blocked_quality", "quality", $"严格模式拒绝质量不完整数据：gaps={quality.SuspectedGaps.Count}, issues={quality.Issues.Count}, incomplete={quality.IncompleteRows}");
         if (contractIssue is not null) return await FinishBlockedAsync(record, runDirectory, "blocked_contract", "contract", contractIssue);
@@ -64,7 +66,8 @@ public sealed class TradeReplayRunner
         {
             record.Status = "running"; _runStore.WriteRecord(runDirectory, record);
             progress?.Report(new TradeReplayProgress(runId, 0, bars.Length, "启动交易策略 Worker"));
-            await RunWorkerAsync(runId, runDirectory, strategySnapshot, parameters, bars, request, record, pending, intents, signals, state, progress, cancellationToken);
+            var sessionRanges = ResolveSessionRanges(bars, request.StartInclusive, request.EndExclusive);
+            await RunWorkerAsync(runId, runDirectory, strategySnapshot, parameters, bars, sessionRanges, request, record, pending, intents, signals, state, progress, cancellationToken);
             foreach (var orphan in pending)
             {
                 _runStore.Append(runDirectory, "orders.jsonl", new OrderRecord(runId, orphan.Intent.Sequence, orphan.Intent.Action, orphan.Intent.Direction, orphan.Intent.Quantity,
@@ -119,7 +122,8 @@ public sealed class TradeReplayRunner
     }
 
     private async Task RunWorkerAsync(string runId, string runDirectory, string strategyPath, IReadOnlyDictionary<string, JsonElement> parameters,
-        IReadOnlyList<Bar> bars, TradeReplayRequest request, TradeRunRecord record, List<PendingIntent> pending, List<TradeIntent> intents,
+        IReadOnlyList<Bar> bars, IReadOnlyDictionary<DateOnly, (DateTimeOffset Start, DateTimeOffset End)[]> sessionRanges,
+        TradeReplayRequest request, TradeRunRecord record, List<PendingIntent> pending, List<TradeIntent> intents,
         List<SignalEvent> signals, AccountState state, IProgress<TradeReplayProgress>? progress, CancellationToken cancellationToken)
     {
         var start = new ProcessStartInfo { FileName = PythonRuntime.ResolveExecutable(), UseShellExecute = false, RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true,
@@ -146,12 +150,22 @@ public sealed class TradeReplayRunner
             {
                 cancellationToken.ThrowIfCancellationRequested(); var bar = bars[index];
                 if (!bar.IsComplete) throw new ReplayWorkerException("incomplete_bar", $"策略输入包含未完成 K 线：{bar.Timestamp:O}");
-                var barEnd = GetBarEnd(bar).ToOffset(bar.Timestamp.Offset); var formal = bar.Timestamp >= request.StartInclusive && bar.Timestamp < request.EndExclusive;
+                var barEnd = GetBarEnd(bar, sessionRanges).ToOffset(bar.Timestamp.Offset); var formal = bar.Timestamp >= request.StartInclusive && bar.Timestamp < request.EndExclusive;
                 var accountingStarted = Stopwatch.GetTimestamp();
                 while (pending.Count > 0)
                 {
                     var scheduled = pending[0]; pending.RemoveAt(0);
                     ExecuteIntent(scheduled.Intent, bar, barEnd, state, request.Config, runDirectory);
+                }
+                // Only a stop submitted on an earlier completed bar may use this
+                // bar's OHLC. A newly tightened stop cannot act retrospectively.
+                var protectiveExit = state.CreateTriggeredProtection(bar, barEnd, nextIntentSequence);
+                if (protectiveExit is not null)
+                {
+                    nextIntentSequence++;
+                    intents.Add(protectiveExit); _runStore.Append(runDirectory, "intents.jsonl", protectiveExit);
+                    record.FormalIntentCount++;
+                    ExecuteIntent(protectiveExit, bar, barEnd, state, request.Config, runDirectory);
                 }
                 accountingMs += ElapsedMilliseconds(accountingStarted);
                 maxPending = Math.Max(maxPending, pending.Count);
@@ -287,11 +301,14 @@ public sealed class TradeReplayRunner
             "open" => state.Open(intent, bar, barEnd, config, directory),
             "open_limit" => state.OpenLimit(intent, bar, barEnd, config, directory),
             "close" => state.Close(intent, bar, barEnd, config, directory),
+            "protect" => state.ArmProtection(intent, barEnd),
+            "close_stop" => state.CloseStop(intent, bar, barEnd, config, directory),
             "reverse" => state.Reverse(intent, bar, barEnd, config, directory),
             _ => "unsupported_action"
         };
-        _runStore.Append(directory, "orders.jsonl", order with { Status = result == "filled" ? "filled" : "unfilled", FailureReason = result == "filled" ? null : result });
-        if (result != "filled") _runStore.Append(directory, "unfilled.jsonl", new { runId = intent.RunId, intentSequence = intent.Sequence, reason = result, executionBarEnd = barEnd });
+        var accepted = result is "filled" or "working";
+        _runStore.Append(directory, "orders.jsonl", order with { Status = accepted ? result : "unfilled", FailureReason = accepted ? null : result });
+        if (!accepted) _runStore.Append(directory, "unfilled.jsonl", new { runId = intent.RunId, intentSequence = intent.Sequence, reason = result, executionBarEnd = barEnd });
     }
 
     private async Task<TradeReplayResult> FinishBlockedAsync(TradeRunRecord record, string directory, string status, string kind, string message)
@@ -300,12 +317,17 @@ public sealed class TradeReplayRunner
         return new TradeReplayResult(record.RunId, status, [], [], [], directory, message);
     }
 
-    private static string? ValidateTradeSeries(IReadOnlyList<Bar> bars)
+    public static bool IsMainContinuousSymbol(string symbol) =>
+        Regex.IsMatch(symbol.Trim(), @"^KQ\.m@[A-Z]+\.[A-Z]+$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    private static string? ValidateTradeSeries(IReadOnlyList<Bar> bars, bool mainContinuousResearch)
     {
         if (bars.Count == 0) return null;
         var symbol = bars[0].Symbol.Trim();
         var exchange = bars[0].Exchange.Trim();
         var identity = $"{symbol}/{exchange}";
+        if (mainContinuousResearch)
+            return IsMainContinuousSymbol(symbol) ? null : $"主连研究模式只接受 KQ.m@ 格式的主连行情，不能使用具体合约或指数：{identity}";
         var lowered = identity.ToLowerInvariant();
         var blocked = new[] { "主连", "连续", "指数", "index", "continuous" };
         var kqContinuous = lowered.StartsWith("kq.m@", StringComparison.Ordinal) || lowered.StartsWith("kq.i@", StringComparison.Ordinal);
@@ -316,7 +338,7 @@ public sealed class TradeReplayRunner
         return null;
     }
 
-    private static void WriteAssumptions(string directory, IReadOnlyList<Bar> bars)
+    private static void WriteAssumptions(string directory, IReadOnlyList<Bar> bars, TradeRunRecord record)
     {
         var symbol = bars.FirstOrDefault()?.Symbol ?? "";
         var exchange = bars.FirstOrDefault()?.Exchange ?? "";
@@ -324,11 +346,15 @@ public sealed class TradeReplayRunner
             (symbol + "/" + exchange).Contains(marker, StringComparison.OrdinalIgnoreCase));
         var assumptions = new
         {
-            contract_scope = "single concrete contract only; continuous/main/index series are rejected for trade replay",
+            backtest_mode = record.BacktestModeDisplayName,
+            main_continuous_research = record.MainContinuousResearch,
+            contract_scope = record.MainContinuousResearch
+                ? "continuous main series used for research simulation only; no actual contract rollover execution"
+                : "single concrete contract only; continuous/main/index series are rejected for trade replay",
             series = new { symbol, exchange, explicitly_marked_synthetic_acceptance = explicitSynthetic },
-            execution = "intent from completed bar; next valid bar open; no queue-book model; no end-of-run forced close",
+            execution = "market intent from completed bar executes next valid bar open; protect intent becomes a persistent stop next valid bar: long min(open,stop), short max(open,stop), plus adverse slippage; updates never act on their signal bar; no queue-book model; no end-of-run forced close",
             accounting = "fixed or rate fee from TradingConfig; margin is a risk check only; no forced liquidation or dynamic settlement",
-            research_limit = "unknown contract metadata is not guessed; user-supplied synthetic acceptance series must be explicitly marked"
+            research_limit = record.ResearchNotice ?? "unknown contract metadata is not guessed; user-supplied synthetic acceptance series must be explicitly marked"
         };
         File.WriteAllText(Path.Combine(directory, "assumptions.json"), JsonSerializer.Serialize(assumptions, new JsonSerializerOptions { WriteIndented = true }), new UTF8Encoding(false));
     }
@@ -426,7 +452,37 @@ public sealed class TradeReplayRunner
     }
     private static ReplayWorkerException CreateOutputLimitException(StrategyOutputLimitException exception, string phase, string stderrPath, string? context = null) =>
         new("output_limit", $"策略输出超限；{(context is null ? $"phase={phase}" : context)}; {exception.Message}; stderr={ReadStderrTail(stderrPath)}", stderrPath);
-    private static DateTimeOffset GetBarEnd(Bar bar) => bar.Timestamp + ParsePeriod(bar.Period);
+    private IReadOnlyDictionary<DateOnly, (DateTimeOffset Start, DateTimeOffset End)[]> ResolveSessionRanges(
+        IReadOnlyList<Bar> bars, DateTimeOffset start, DateTimeOffset end)
+    {
+        if (bars.Count == 0 || !HistoricalCalendarResolver.TryLoad(
+                _dataStore.RootDirectory, bars[0].Symbol, start, end,
+                out _, out var ranges, out _, out _, out _))
+            return new Dictionary<DateOnly, (DateTimeOffset Start, DateTimeOffset End)[]>();
+
+        return ranges
+            .Select(range => (
+                TradingDay: DateOnly.Parse(range.TradingDay, CultureInfo.InvariantCulture),
+                Start: DateTimeOffset.Parse(range.Start, CultureInfo.InvariantCulture),
+                End: DateTimeOffset.Parse(range.End, CultureInfo.InvariantCulture)))
+            .GroupBy(range => range.TradingDay)
+            .ToDictionary(
+                group => group.Key,
+                group => group.Select(range => (range.Start, range.End)).OrderBy(range => range.Start).ToArray());
+    }
+
+    private static DateTimeOffset GetBarEnd(Bar bar, IReadOnlyDictionary<DateOnly, (DateTimeOffset Start, DateTimeOffset End)[]> sessionRanges)
+    {
+        var nominalEnd = bar.Timestamp + ParsePeriod(bar.Period);
+        if (!sessionRanges.TryGetValue(bar.TradingDay, out var ranges)) return nominalEnd;
+        foreach (var range in ranges)
+        {
+            var start = range.Start.ToOffset(bar.Timestamp.Offset);
+            var end = range.End.ToOffset(bar.Timestamp.Offset);
+            if (bar.Timestamp >= start && bar.Timestamp < end && end < nominalEnd) return end;
+        }
+        return nominalEnd;
+    }
     private static double ElapsedMilliseconds(long started) => (Stopwatch.GetTimestamp() - started) * 1000.0 / Stopwatch.Frequency;
     private static TimeSpan ParsePeriod(string period) => period.Length >= 2 && int.TryParse(period[..^1], out var value) && value > 0 ? char.ToLowerInvariant(period[^1]) switch { 'm' => TimeSpan.FromMinutes(value), 'h' => TimeSpan.FromHours(value), 'd' => TimeSpan.FromDays(value), _ => throw new InvalidDataException($"不支持的周期：{period}") } : throw new InvalidDataException($"不支持的周期：{period}");
     private sealed record PendingIntent(TradeIntent Intent);
@@ -445,12 +501,14 @@ public sealed class TradeReplayRunner
     {
         private readonly TradingConfig _config; private readonly string _runId; private readonly TradeRunStore _store; private readonly string _directory; private readonly List<FillRecord> _fills; private readonly List<ClosedTradeRecord> _closed;
         private Position? _position; private int _fillSequence; private decimal _realizedGross; private decimal _fees; private decimal _floating; private decimal _peak; private decimal _lastEquity;
+        private TradeIntent? _protection;
         public decimal RealizedGross => _realizedGross; public decimal TotalFees => _fees; public decimal FinalEquity { get; private set; } public decimal MaxDrawdown { get; private set; }
         public AccountState(TradingConfig config, string runId, TradeRunStore store, string directory, List<FillRecord> fills, List<ClosedTradeRecord> closed) { _config = config; _runId = runId; _store = store; _directory = directory; _fills = fills; _closed = closed; _peak = config.InitialEquity; _lastEquity = config.InitialEquity; }
         public object ReadOnlyContext(Bar bar, DateTimeOffset barEnd) => new
         {
             position = _position is null ? (object?)null : new { direction = _position.Direction, quantity = _position.Quantity, entry_price = _position.EntryPrice, entry_trading_day = _position.EntryTradingDay.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) },
-            account = new { equity = Equity(bar.Close), realized_gross = _realizedGross, fees = _fees, floating_pnl = FloatingAtPrice(bar.Close), valuation_bar_end = barEnd.ToString("O", CultureInfo.InvariantCulture), last_processed_bar_end = barEnd.ToString("O", CultureInfo.InvariantCulture) }
+            account = new { equity = Equity(bar.Close), realized_gross = _realizedGross, fees = _fees, floating_pnl = FloatingAtPrice(bar.Close), valuation_bar_end = barEnd.ToString("O", CultureInfo.InvariantCulture), last_processed_bar_end = barEnd.ToString("O", CultureInfo.InvariantCulture) },
+            costs = new { fee_mode = _config.FeeMode == TradingFeeMode.Rate ? "rate" : "fixed", multiplier = _config.Multiplier, fee_rate = _config.FeeRate, open_fee = _config.OpenFee, today_close_fee = _config.TodayCloseFee, ordinary_close_fee = _config.OrdinaryCloseFee }
         };
         public bool IsEffectiveExitIntent(TradeIntent intent, TradingConfig config)
         {
@@ -474,13 +532,18 @@ public sealed class TradeReplayRunner
         public string OpenLimit(TradeIntent intent, Bar bar, DateTimeOffset barEnd, TradingConfig config, string directory)
         {
             if (_position is not null) return "position_already_open";
-            if (intent.Direction != "long") return "open_limit_long_only";
+            if (intent.Direction is not ("long" or "short")) return "invalid_direction";
             if (intent.ReferencePrice is not { } limitPrice || limitPrice <= 0) return "invalid_limit_price";
             var quantity = intent.Quantity * config.Lots;
             var effectiveIntent = intent with { Quantity = quantity };
-            var marketableAtOpen = bar.Open <= limitPrice;
-            if (!marketableAtOpen && bar.Low > limitPrice) return "limit_not_touched";
-            var price = marketableAtOpen ? Math.Min(FillPrice(bar.Open, "open", intent.Direction, config), limitPrice) : limitPrice;
+            var isLong = intent.Direction == "long";
+            var marketableAtOpen = isLong ? bar.Open <= limitPrice : bar.Open >= limitPrice;
+            var limitTouched = isLong ? bar.Low <= limitPrice : bar.High >= limitPrice;
+            if (!marketableAtOpen && !limitTouched) return "limit_not_touched";
+            var price = marketableAtOpen
+                ? isLong ? Math.Min(FillPrice(bar.Open, "open", intent.Direction, config), limitPrice)
+                         : Math.Max(FillPrice(bar.Open, "open", intent.Direction, config), limitPrice)
+                : limitPrice;
             if (price <= 0) { Risk(barEnd, "invalid_fill_price", $"限价单成交价 {price} 非法，拒绝成交", intent.Sequence); return "invalid_fill_price"; }
             var fee = Fee(price, quantity, true, config, null, bar.TradingDay);
             var margin = price * config.Multiplier * quantity * config.MarginRate;
@@ -490,15 +553,48 @@ public sealed class TradeReplayRunner
             return "filled";
         }
         public string Close(TradeIntent intent, Bar bar, DateTimeOffset barEnd, TradingConfig config, string directory)
+            => CloseAt(intent, bar, barEnd, config, bar.Open);
+        public string CloseStop(TradeIntent intent, Bar bar, DateTimeOffset barEnd, TradingConfig config, string directory)
+            => CloseAt(intent, bar, barEnd, config, intent.ReferencePrice!.Value);
+        private string CloseAt(TradeIntent intent, Bar bar, DateTimeOffset barEnd, TradingConfig config, decimal executionBase)
         {
             if (_position is null) return "no_position"; if (!string.Equals(_position.Direction, intent.Direction, StringComparison.OrdinalIgnoreCase)) return "direction_mismatch";
             var position = _position; var requestedQuantity = intent.Quantity * config.Lots; if (requestedQuantity != position.Quantity) return "close_quantity_mismatch_full_position_only";
-            var effectiveIntent = intent with { Quantity = position.Quantity }; var price = FillPrice(bar.Open, "close", position.Direction, config);
+            var effectiveIntent = intent with { Quantity = position.Quantity }; var price = FillPrice(executionBase, "close", position.Direction, config);
             if (price <= 0) { Risk(barEnd, "invalid_fill_price", $"平仓尝试价 {price} 非法，拒绝成交", intent.Sequence); return "invalid_fill_price"; }
-            var fee = Fee(price, position.Quantity, false, config, position.EntryTradingDay, bar.TradingDay); var fill = AddFill(effectiveIntent, barEnd, bar.TradingDay, price, fee, "close", "closed", config, Math.Abs(price - bar.Open), config.FeeMode == TradingFeeMode.Rate ? "rate" : (position.EntryTradingDay == bar.TradingDay ? "fixed_today_close" : "fixed_ordinary_close"));
+            var fee = Fee(price, position.Quantity, false, config, position.EntryTradingDay, bar.TradingDay); var fill = AddFill(effectiveIntent, barEnd, bar.TradingDay, price, fee, "close", "closed", config, Math.Abs(price - executionBase), config.FeeMode == TradingFeeMode.Rate ? "rate" : (position.EntryTradingDay == bar.TradingDay ? "fixed_today_close" : "fixed_ordinary_close"));
             var gross = position.Direction == "long" ? (price - position.EntryPrice) * config.Multiplier * position.Quantity : (position.EntryPrice - price) * config.Multiplier * position.Quantity;
             var closedFees = position.EntryFee + fee; var closed = new ClosedTradeRecord(_runId, position.EntryFillSequence, fill.FillSequence, position.Direction, position.Quantity, position.EntryPrice, price, gross, closedFees, gross - closedFees, position.EntryTradingDay, bar.TradingDay);
-            _closed.Add(closed); _store.Append(_directory, "closed-trades.jsonl", closed); _realizedGross += gross; _position = null; return "filled";
+            _closed.Add(closed); _store.Append(_directory, "closed-trades.jsonl", closed); _realizedGross += gross;
+            FinishProtection("cancelled", barEnd, "position_closed"); _position = null; return "filled";
+        }
+        public string ArmProtection(TradeIntent intent, DateTimeOffset barEnd)
+        {
+            if (_position is null) return "no_position";
+            if (intent.Direction != _position.Direction) return "direction_mismatch";
+            if (intent.Quantity * _config.Lots != _position.Quantity) return "close_quantity_mismatch_full_position_only";
+            if (intent.ReferencePrice is not { } stop || stop <= 0 || stop % _config.MinTick != 0) return "invalid_stop_price";
+            if (_protection?.ReferencePrice is { } previous && (_position.Direction == "long" ? stop < previous : stop > previous)) return "stop_would_loosen";
+            FinishProtection("replaced", barEnd, "protection_updated"); _protection = intent; return "working";
+        }
+        public TradeIntent? CreateTriggeredProtection(Bar bar, DateTimeOffset barEnd, int sequence)
+        {
+            if (_position is null || _protection?.ReferencePrice is not { } stop) return null;
+            var isLong = _position.Direction == "long";
+            if (isLong ? bar.Low > stop : bar.High < stop) return null;
+            var source = _protection;
+            var executionBase = isLong ? Math.Min(bar.Open, stop) : Math.Max(bar.Open, stop);
+            var gap = executionBase != stop;
+            var description = $"{source.Description}；{(gap ? "开盘跳过保护价，按较差开盘价" : "盘中触及保护价，按保护价")} {executionBase:0.####} {(isLong ? "减" : "加")}滑点{_config.SlippageTicks * _config.MinTick:0.####}点成交";
+            FinishProtection("triggered", barEnd, null);
+            return source with { Action = "close_stop", SignalBarStart = bar.Timestamp, SignalBarEnd = barEnd, Sequence = sequence, ReferencePrice = executionBase, Description = description,
+                RawJson = JsonSerializer.Serialize(new { source = "previous_bar_protection", protectionIntentSequence = source.Sequence, protectedStop = stop, gapAtOpen = gap }) };
+        }
+        private void FinishProtection(string status, DateTimeOffset barEnd, string? reason)
+        {
+            if (_protection is not { } intent) return;
+            _store.Append(_directory, "orders.jsonl", new OrderRecord(_runId, intent.Sequence, intent.Action, intent.Direction, intent.Quantity, intent.SignalBarEnd, barEnd, status, reason));
+            _protection = null;
         }
         public string Reverse(TradeIntent intent, Bar bar, DateTimeOffset barEnd, TradingConfig config, string directory)
         {

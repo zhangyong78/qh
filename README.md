@@ -2,9 +2,19 @@
 
 当前项目包含 Windows x64 WPF 研究入口、CSV 快照/质量校验、Signal/Trade Python 策略回放、模拟撮合/权益结果、只读重开和受管理 Worker 的取消/退出收尾。配套 self-contained 运行包提供包内 .NET、Python 和项目隔离 TqSdk；源码归档不嵌入这些 runtime。
 
+当前应用版本：**v0.1.0**。版本显示在主窗口标题和首页标题中。
+
 ## 源码构建前置条件
 
 目标环境为 Windows 11 + PowerShell 7。源码归档不包含 `tools\dotnet`、.NET runtime、Python runtime、`bin/`、`obj/` 或用户数据；直接构建需要本机安装 .NET 10 SDK：
+
+桌面“期货研究与回测工作台”快捷方式运行 `tools\start-dev.ps1`，始终从当前源码启动开发版。手动运行：
+
+```powershell
+& '.\tools\start-dev.ps1'
+```
+
+也可以直接运行项目：
 
 ```powershell
 dotnet build 'src\Qh.Cli\Qh.Cli.csproj' -c Release

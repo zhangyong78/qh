@@ -60,9 +60,14 @@ public sealed record SnapshotInfo(
     DateTimeOffset CreatedAt)
 {
     public string PeriodDisplayName => PeriodLabel(Period);
+    public bool IsMainContinuous => TradeReplayRunner.IsMainContinuousSymbol(Symbol);
+    public string SeriesDisplayName => IsMainContinuous
+        ? (string.Equals(Symbol, "KQ.m@CZCE.SR", StringComparison.OrdinalIgnoreCase) ? "白糖主连（研究）" : $"{Symbol}（主连研究）")
+        : Symbol;
+    public string ContractPeriodDisplayName => $"{SeriesDisplayName} · {PeriodDisplayName} · {FirstTimestamp:yyyy-MM-dd}～{LastTimestamp:yyyy-MM-dd}";
 
     public string DisplayName =>
-        $"{Symbol} · {PeriodDisplayName} · {FirstTimestamp:yyyy-MM-dd}～{LastTimestamp:yyyy-MM-dd} · {RowCount:N0} 根";
+        $"{SeriesDisplayName} · {PeriodDisplayName} · {FirstTimestamp:yyyy-MM-dd}～{LastTimestamp:yyyy-MM-dd} · {RowCount:N0} 根";
 
     private static string PeriodLabel(string period)
     {

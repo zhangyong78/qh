@@ -83,22 +83,28 @@ public sealed class TradeRunStore
     public void ExportFillsCsv(string runId, string outputPath)
     {
         var fills = ReadMany<FillRecord>(runId, "fills.jsonl");
-        var builder = new StringBuilder("run_id,intent_sequence,fill_sequence,action,direction,quantity,bar_end,trading_day,price,notional,fee,fee_type,slippage,position_effect\n");
+        var record = ReadRecord(runId);
+        var researchHeader = record.MainContinuousResearch ? ",backtest_mode,research_notice" : "";
+        var researchValues = record.MainContinuousResearch ? $",{Escape(record.BacktestModeDisplayName)},{Escape(record.ResearchNotice!)}" : "";
+        var builder = new StringBuilder("run_id,intent_sequence,fill_sequence,action,direction,quantity,bar_end,trading_day,price,notional,fee,fee_type,slippage,position_effect" + researchHeader + "\n");
         foreach (var fill in fills)
         {
             builder.AppendLine(string.Join(',', new[] { fill.RunId, fill.IntentSequence.ToString(), fill.FillSequence.ToString(), fill.Action, fill.Direction,
                 fill.Quantity.ToString(), fill.BarEnd.ToString("O"), fill.TradingDay.ToString("O"), fill.Price.ToString(System.Globalization.CultureInfo.InvariantCulture),
                 fill.Notional.ToString(System.Globalization.CultureInfo.InvariantCulture), fill.Fee.ToString(System.Globalization.CultureInfo.InvariantCulture), fill.FeeType,
-                fill.Slippage.ToString(System.Globalization.CultureInfo.InvariantCulture), fill.PositionEffect }.Select(Escape)));
+                fill.Slippage.ToString(System.Globalization.CultureInfo.InvariantCulture), fill.PositionEffect }.Select(Escape)) + researchValues);
         }
         File.WriteAllText(Path.GetFullPath(outputPath), builder.ToString(), new UTF8Encoding(false));
     }
 
     public void ExportEquityCsv(string runId, string outputPath)
     {
-        var builder = new StringBuilder("run_id,bar_end,equity,realized_gross_pnl,fees,floating_pnl,drawdown\n");
+        var record = ReadRecord(runId);
+        var researchHeader = record.MainContinuousResearch ? ",backtest_mode,research_notice" : "";
+        var researchValues = record.MainContinuousResearch ? $",{Escape(record.BacktestModeDisplayName)},{Escape(record.ResearchNotice!)}" : "";
+        var builder = new StringBuilder("run_id,bar_end,equity,realized_gross_pnl,fees,floating_pnl,drawdown" + researchHeader + "\n");
         foreach (var point in ReadMany<EquityPoint>(runId, "equity.jsonl"))
-            builder.AppendLine(string.Join(',', new[] { point.RunId, point.BarEnd.ToString("O"), point.Equity.ToString(System.Globalization.CultureInfo.InvariantCulture), point.RealizedGrossPnl.ToString(System.Globalization.CultureInfo.InvariantCulture), point.Fees.ToString(System.Globalization.CultureInfo.InvariantCulture), point.FloatingPnl.ToString(System.Globalization.CultureInfo.InvariantCulture), point.Drawdown.ToString(System.Globalization.CultureInfo.InvariantCulture) }.Select(Escape)));
+            builder.AppendLine(string.Join(',', new[] { point.RunId, point.BarEnd.ToString("O"), point.Equity.ToString(System.Globalization.CultureInfo.InvariantCulture), point.RealizedGrossPnl.ToString(System.Globalization.CultureInfo.InvariantCulture), point.Fees.ToString(System.Globalization.CultureInfo.InvariantCulture), point.FloatingPnl.ToString(System.Globalization.CultureInfo.InvariantCulture), point.Drawdown.ToString(System.Globalization.CultureInfo.InvariantCulture) }.Select(Escape)) + researchValues);
         File.WriteAllText(Path.GetFullPath(outputPath), builder.ToString(), new UTF8Encoding(false));
     }
 

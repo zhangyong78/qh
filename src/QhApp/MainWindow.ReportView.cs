@@ -37,15 +37,30 @@ public partial class MainWindow
         {
             using var document = JsonDocument.Parse(key);
             var parameters = document.RootElement;
-            if (!parameters.TryGetProperty("fast_period", out var fastValue) ||
-                !parameters.TryGetProperty("slow_period", out var slowValue)) return;
-            var fast = fastValue.GetInt32();
-            var slow = slowValue.GetInt32();
-            var average = parameters.TryGetProperty("average", out var type) ? type.GetString() : "sma";
+            int fast;
+            int slow;
+            string average;
+            if (parameters.TryGetProperty("ema_period", out var emaValue) &&
+                parameters.TryGetProperty("trend_ema_period", out var trendEmaValue))
+            {
+                fast = emaValue.GetInt32();
+                slow = trendEmaValue.GetInt32();
+                average = "ema";
+            }
+            else if (parameters.TryGetProperty("fast_period", out var fastValue) &&
+                     parameters.TryGetProperty("slow_period", out var slowValue))
+            {
+                fast = fastValue.GetInt32();
+                slow = slowValue.GetInt32();
+                average = parameters.TryGetProperty("average", out var type) ? type.GetString() ?? "sma" : "sma";
+            }
+            else return;
             if (fast < 1 || slow <= fast || slow > 10000 || average is not ("sma" or "ema")) return;
             _fastAverage = Indicators.Calculate(_bars, fast).Select(p => average == "ema" ? p.Ema : p.Sma).ToArray();
             _slowAverage = Indicators.Calculate(_bars, slow).Select(p => average == "ema" ? p.Ema : p.Sma).ToArray();
-            _averageLabel = $"{average.ToUpperInvariant()} 快{fast}（橙） / 慢{slow}（蓝）";
+            _averageLabel = average == "ema"
+                ? $"EMA{fast}（橙） / EMA{slow}（蓝）"
+                : $"SMA 快{fast}（橙） / 慢{slow}（蓝）";
         }
         catch (Exception ex) when (ex is JsonException or InvalidOperationException or FormatException or OverflowException)
         {
@@ -57,14 +72,40 @@ public partial class MainWindow
         }
     }
 
-    private void RefreshTradeReport(IReadOnlyList<ClosedTradeRecord> closed)
+    private void RefreshTradeReport(IReadOnlyList<ClosedTradeRecord> closed, IReadOnlyList<TradeIntent>? intents = null)
     {
         var fills = _tradeFills.ToDictionary(f => f.FillSequence);
-        ClosedTradeGrid.ItemsSource = closed.Select(t => new ClosedTradeView(
-            t.Direction == "long" ? "多" : "空", t.Quantity,
-            fills.GetValueOrDefault(t.EntryFillSequence)?.BarEnd,
-            fills.GetValueOrDefault(t.ExitFillSequence)?.BarEnd,
-            t.EntryPrice, t.ExitPrice, t.GrossPnl, t.Fees, t.NetPnl, t.ExitFillSequence)).ToArray();
+        var intentsBySequence = (intents ?? []).ToDictionary(intent => intent.Sequence);
+        var multiplier = _activeTradeRecord?.Config.Multiplier ?? 0;
+        ClosedTradeGrid.ItemsSource = closed.Select(t =>
+        {
+            var entryFill = fills.GetValueOrDefault(t.EntryFillSequence);
+            var exitFill = fills.GetValueOrDefault(t.ExitFillSequence);
+            var initialStop = entryFill is null || exitFill is null
+                ? null
+                : intentsBySequence.Values
+                    .Where(intent => intent.Action == "protect" && intent.Direction == t.Direction
+                        && intent.SignalBarEnd >= entryFill.BarEnd && intent.SignalBarEnd <= exitFill.BarEnd
+                        && intent.Description.StartsWith("初始ATR", StringComparison.Ordinal)
+                        && intent.ReferencePrice is not null)
+                    .OrderBy(intent => intent.SignalBarEnd).ThenBy(intent => intent.Sequence)
+                    .Select(intent => intent.ReferencePrice).FirstOrDefault();
+            var initialRiskPoints = initialStop is { } stop && multiplier > 0
+                ? Math.Abs(entryFill!.Price - stop)
+                : (decimal?)null;
+            var initialRiskAmount = initialRiskPoints is > 0
+                ? initialRiskPoints.Value * t.Quantity * multiplier
+                : (decimal?)null;
+            var netR = initialRiskAmount is > 0 ? t.NetPnl / initialRiskAmount.Value : (decimal?)null;
+            return new ClosedTradeView(
+                t.Direction == "long" ? "多" : "空", t.Quantity,
+                entryFill?.BarEnd, exitFill?.BarEnd,
+                t.EntryPrice, t.ExitPrice, initialRiskPoints, netR, t.GrossPnl, t.Fees, t.NetPnl,
+                exitFill is not null && intentsBySequence.TryGetValue(exitFill.IntentSequence, out var exitIntent)
+                    ? FormatExitReason(exitIntent.Description)
+                    : "未记录出场原因",
+                t.ExitFillSequence);
+        }).ToArray();
         if (_activeTradeRecord is not { } r)
         {
             ReportDetailsText.Text = "导入行情并完成交易回放，或输入已有 run ID 打开结果。";
@@ -76,6 +117,7 @@ public partial class MainWindow
             ? $"开仓 {c.OpenFee:0.##} / 平今 {c.TodayCloseFee:0.##} / 平昨 {c.OrdinaryCloseFee:0.##} 元/手"
             : $"按成交额 {c.FeeRate:P4}";
         ReportDetailsText.Text = $"运行：{r.RunId}\n状态：{r.Status}  |  {(r.Explore ? "探索模式" : "严格模式")}\n" +
+            $"回测口径：{r.BacktestModeDisplayName}\n" + (r.ResearchNotice is { } notice ? notice + "\n" : "") +
             $"合约：{_bars.FirstOrDefault()?.Symbol}  |  周期：{_bars.FirstOrDefault()?.Period}\n" +
             $"策略：{r.StrategyName}\n参数：{JsonSerializer.Serialize(r.Parameters)}\n" +
             $"区间（左闭右开）：\n{r.StartInclusive:yyyy-MM-dd HH:mm zzz} → {r.EndExclusive:yyyy-MM-dd HH:mm zzz}\n" +
@@ -90,9 +132,29 @@ public partial class MainWindow
             (r.ErrorMessage is null ? "" : $"运行说明：{r.ErrorMessage}\n") + $"结果目录：{_tradeRunDirectory}";
     }
 
+    private static string FormatExitReason(string description)
+    {
+        if (description.Contains("收盘确认触及保护价", StringComparison.Ordinal) && description.Contains("下一根有效K线开盘", StringComparison.Ordinal))
+            return "【旧保护成交口径，需重跑】" + description;
+        const string oldStopMarker = "动态保护价 ";
+        if (description.StartsWith("收盘后确认本根触及", StringComparison.Ordinal))
+        {
+            var stopMarkerIndex = description.IndexOf(oldStopMarker, StringComparison.Ordinal);
+            if (stopMarkerIndex >= 0)
+            {
+                var price = description[(stopMarkerIndex + oldStopMarker.Length)..].Split('；', 2)[0];
+                return $"【旧保护成交口径，需重跑】动态保护止损触发（保护价 {price}；旧记录未保存锁盈R档），下一有效K线开盘平仓";
+            }
+        }
+        if (description.StartsWith("盈利达到", StringComparison.Ordinal))
+            return description.Replace("盈利达到", "达到", StringComparison.Ordinal);
+        return description;
+    }
+
     private sealed record ClosedTradeView(string Direction, int Quantity, DateTimeOffset? EntryTime,
-        DateTimeOffset? ExitTime, decimal EntryPrice, decimal ExitPrice, decimal GrossPnl, decimal Fees,
-        decimal NetPnl, int ExitFillSequence);
+        DateTimeOffset? ExitTime, decimal EntryPrice, decimal ExitPrice, decimal? InitialRiskPoints,
+        decimal? NetRMultiple, decimal GrossPnl, decimal Fees, decimal NetPnl, string ExitReason,
+        int ExitFillSequence);
 
     private void ClosedTradeGrid_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
@@ -149,6 +211,8 @@ public partial class MainWindow
         }
         RunIdText.Text = runId;
         await OpenRunButtonCoreAsync();
-        return _activeTradeRecord?.RunId == runId;
+        var opened = _activeTradeRecord?.RunId == runId;
+        if (opened) WorkflowTabs.SelectedIndex = 1;
+        return opened;
     }
 }

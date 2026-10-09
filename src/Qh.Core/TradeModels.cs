@@ -41,7 +41,8 @@ public sealed record TradeReplayRequest(
     TradingConfig Config,
     IReadOnlyDictionary<string, JsonElement>? Parameters = null,
     bool Explore = false,
-    double StrategyTimeoutSeconds = 2.0);
+    double StrategyTimeoutSeconds = 2.0,
+    bool MainContinuousResearch = false);
 
 public sealed record TradeIntent(
     string RunId,
@@ -138,6 +139,11 @@ public sealed class TradeRunRecord
     public DateTimeOffset StartInclusive { get; init; }
     public DateTimeOffset EndExclusive { get; init; }
     public bool Explore { get; init; }
+    public bool MainContinuousResearch { get; init; }
+    public string BacktestModeDisplayName => MainContinuousResearch ? "主连研究回测（模拟盈亏）" : "具体合约回测";
+    public string? ResearchNotice => MainContinuousResearch
+        ? "收益按主连连续价格模拟；未模拟真实合约换仓及换仓费用，换月价差会影响指标、止损和盈亏。"
+        : null;
     public bool DataIncomplete { get; set; }
     public int InputRows { get; set; }
     public int ProcessedRows { get; set; }

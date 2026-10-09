@@ -227,10 +227,12 @@ static async Task<int> TradeReplayAsync(string[] arguments)
         var config = new TradingConfig();
         var parameters = new Dictionary<string, JsonElement>(StringComparer.Ordinal);
         var explore = false;
+        var mainContinuousResearch = false;
         var cancelAfterMs = (int?)null;
         foreach (var argument in arguments.Skip(6))
         {
             if (argument == "--explore") { explore = true; continue; }
+            if (argument == "--main-continuous-research") { mainContinuousResearch = true; continue; }
             if (argument.StartsWith("--cancel-after-ms=", StringComparison.Ordinal)) { cancelAfterMs = int.Parse(argument[18..], CultureInfo.InvariantCulture); continue; }
             if (argument.StartsWith("--initial-equity=", StringComparison.Ordinal)) { config = config with { InitialEquity = ParseDecimal(argument[17..]) }; continue; }
             if (argument.StartsWith("--lots=", StringComparison.Ordinal)) { config = config with { Lots = int.Parse(argument[7..], CultureInfo.InvariantCulture) }; continue; }
@@ -258,7 +260,8 @@ static async Task<int> TradeReplayAsync(string[] arguments)
             if (item.ProcessedRows == 0 || item.ProcessedRows == item.TotalRows || item.ProcessedRows % 1000 == 0)
                 Console.WriteLine($"run={item.RunId}; processed={item.ProcessedRows}/{item.TotalRows}; stage={item.Stage}");
         });
-        var result = await new TradeReplayRunner(store, DefaultWorkerPath()).ReplayAsync(new TradeReplayRequest(snapshotId, strategy, start, end, config, parameters, explore), progress, cancellation.Token);
+        var result = await new TradeReplayRunner(store, DefaultWorkerPath()).ReplayAsync(new TradeReplayRequest(snapshotId, strategy, start, end, config, parameters, explore,
+            MainContinuousResearch: mainContinuousResearch), progress, cancellation.Token);
         Console.WriteLine($"run_id={result.RunId}; status={result.Status}; intents={result.Intents.Count}; fills={result.Fills.Count}; closed_trades={result.ClosedTrades.Count}; directory={result.RunDirectory}");
         if (result.ErrorMessage is not null) Console.WriteLine($"error={result.ErrorMessage}");
         if (File.Exists(Path.Combine(result.RunDirectory, "run.json"))) Console.WriteLine(File.ReadAllText(Path.Combine(result.RunDirectory, "run.json")));

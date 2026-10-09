@@ -229,7 +229,7 @@ public sealed class CsvImporter
             var missing = new List<DateTimeOffset>();
             for (var candidate = previous.Timestamp + expected; candidate < current.Timestamp; candidate += expected)
             {
-                if (IsTradableTimestamp(candidate, previous.Symbol)) missing.Add(candidate);
+                if (IsTradableTimestamp(candidate, previous.Symbol, minutes)) missing.Add(candidate);
             }
             if (missing.Count == 0) continue;
             var segments = new List<string>();
@@ -250,24 +250,35 @@ public sealed class CsvImporter
         return result;
     }
 
-    internal static bool IsTradableTimestamp(DateTimeOffset timestamp, string? symbol = null)
+    internal static bool IsTradableTimestamp(DateTimeOffset timestamp, string? symbol = null, int periodMinutes = 15)
     {
         var local = timestamp.ToOffset(ChinaOffset);
         var time = TimeOnly.FromDateTime(local.DateTime);
+        var duration = TimeSpan.FromMinutes(periodMinutes);
         // CZCE white sugar closes at 23:00; Friday's night session belongs to
         // Monday, but Saturday/Sunday are not missing trading sessions.
         // Source: CZCE white sugar business rules, article 8 (2024-06-26).
-        if (symbol is not null && Regex.IsMatch(symbol, @"^CZCE\.SR\d+$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant))
+        if (symbol is not null && Regex.IsMatch(symbol, @"^(CZCE\.SR\d+|KQ\.m@CZCE\.SR)$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant))
         {
             if (local.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday) return false;
-            return Sessions.Take(4).Any(session => session.Contains(time));
+            return Sessions.Take(4).Any(session => session.ContainsFullBar(time, duration));
         }
-        return Sessions.Any(session => session.Contains(time));
+        return Sessions.Any(session => session.ContainsFullBar(time, duration));
     }
 
     private sealed record TradingSession(string Id, TimeOnly Start, TimeOnly End)
     {
         public bool Contains(TimeOnly time) => Start < End ? time >= Start && time < End : time >= Start || time < End;
+
+        public bool ContainsFullBar(TimeOnly time, TimeSpan duration)
+        {
+            if (Start < End)
+                return time >= Start && time < End && time.ToTimeSpan() + duration <= End.ToTimeSpan();
+
+            if (time >= Start)
+                return (TimeSpan.FromDays(1) - time.ToTimeSpan()) + End.ToTimeSpan() >= duration;
+            return time < End && End.ToTimeSpan() - time.ToTimeSpan() >= duration;
+        }
     }
 
     private static string CanonicalText(IEnumerable<Bar> bars) => string.Join('\n', bars.Select(x => string.Join(',',

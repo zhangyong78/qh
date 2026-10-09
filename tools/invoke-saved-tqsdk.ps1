@@ -3,6 +3,8 @@ param(
     [string]$Symbol = 'CZCE.SR701',
     [string]$Start = '2025-01-01T00:00:00+08:00',
     [string]$End = '2026-10-03T00:00:00+08:00',
+    [ValidateSet(60,300,900,1800,3600,86400)][int]$DurationSeconds = 900,
+    [string]$CalendarPath,
     [switch]$Professional,
     [string]$OutputPath
 )
@@ -17,8 +19,16 @@ try {
     $credential = [Text.Encoding]::UTF8.GetString($plainBytes) | ConvertFrom-Json
     $request = @{ op=$Operation; account=$credential.Account; password=$credential.Password }
     if ($Operation -eq 'history') {
-        $request.symbol=$Symbol; $request.duration_seconds=900
+        $request.symbol=$Symbol; $request.duration_seconds=$DurationSeconds
         $request.start=$Start; $request.end=$End; $request.professional=[bool]$Professional
+        if (-not $CalendarPath) { $CalendarPath = Join-Path $projectRoot 'artifacts\sr2701-15m\wenhua-aligned-data\calendar.json' }
+        if (Test-Path -LiteralPath $CalendarPath) {
+            $calendar = Get-Content -LiteralPath $CalendarPath -Raw | ConvertFrom-Json
+            $request.provider_trading_days = @($calendar.trading_days)
+            $request.provider_session_ranges = @($calendar.session_ranges)
+            $request.provider_calendar_source = $calendar.source
+            $request.coverage_evidence = $calendar.source
+        }
     }
     $info = [Diagnostics.ProcessStartInfo]::new()
     $info.FileName = Join-Path $runtimeRoot 'app/python/python.exe'

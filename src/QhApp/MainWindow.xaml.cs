@@ -1,4 +1,4 @@
-using Microsoft.Win32;
+﻿using Microsoft.Win32;
 using Qh.Core;
 using System.Diagnostics;
 using System.Globalization;
@@ -32,6 +32,7 @@ public partial class MainWindow : Window
     private Task<SignalReplayResult>? _replayOperation;
     private Task<TradeReplayResult>? _tradeReplayOperation;
     private readonly SemaphoreSlim _contextGate = new(1, 1);
+    private Task? _initialSnapshotLoadTask;
     private readonly TqCredentialVault _tqCredentialVault = new();
     private CancellationTokenSource? _tqProbeCancellation;
     private Task<MarketOperationResult<TqSdkCapabilities>>? _tqProbeOperation;
@@ -94,7 +95,7 @@ public partial class MainWindow : Window
     public MainWindow(string? dataRoot = null, bool autoLoadLatest = true)
     {
         InitializeComponent();
-        TradeConfigText.Text = "{\"initialEquity\":10000,\"lots\":1,\"multiplier\":10,\"minTick\":1,\"marginRate\":0.1,\"feeMode\":\"Fixed\",\"openFee\":2,\"todayCloseFee\":3,\"ordinaryCloseFee\":1,\"feeRate\":0,\"slippageTicks\":0}";
+        TradeConfigText.Text = "{\"initialEquity\":2000000,\"lots\":1,\"multiplier\":10,\"minTick\":1,\"marginRate\":0.1,\"feeMode\":\"Fixed\",\"openFee\":2,\"todayCloseFee\":3,\"ordinaryCloseFee\":1,\"feeRate\":0,\"slippageTicks\":1}";
         _store = new DataStore(dataRoot ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "QhResearch", "data"));
         _liveNotifyStore = new LiveNotifyStore(_store.RootDirectory);
         _liveNotificationSink = new LiveNotificationSink(this);
@@ -104,10 +105,12 @@ public partial class MainWindow : Window
         RefreshTqLiveSymbolOptions();
         UpdateTqHistoryCalendarReadiness();
         RefreshLiveReminderList();
-        var bundledStrategy = Path.Combine(AppContext.BaseDirectory, "strategies", "sma_ema_cross.py");
+        var selectedStrategyFile = (StrategyPresetCombo.SelectedItem as ComboBoxItem)?.Tag?.ToString() ?? "ema_dynamic_long_trade.py";
+        var bundledStrategy = Path.Combine(AppContext.BaseDirectory, "strategies", selectedStrategyFile);
         if (File.Exists(bundledStrategy)) StrategyPathText.Text = bundledStrategy;
         UpdateStrategyCardForPreset();
         UpdateLiveStrategySelectionSummary();
+        Loaded += (_, _) => UpdateStrategyCardForPreset();
         if (_tqCredentialVault.Exists)
         {
             try
@@ -120,6 +123,35 @@ public partial class MainWindow : Window
         }
         if (autoLoadLatest) Loaded += async (_, _) => await LoadLatestSnapshotAsync();
         Closing += MainWindow_Closing;
+    }
+
+    internal Task LoadInitialSnapshotAsync() => _initialSnapshotLoadTask ??= LoadInitialSnapshotCoreAsync();
+
+    private async Task LoadInitialSnapshotCoreAsync()
+    {
+        for (var attempt = 1; attempt <= 3; attempt++)
+        {
+            RecordStartupEvent($"load-started: attempt={attempt}");
+            try { await LoadLatestSnapshotAsync(); }
+            catch (Exception ex) { RecordStartupEvent("load-unhandled-error: " + ex); }
+            if (_currentSnapshotId is not null && _bars.Count > 0)
+            {
+                RecordStartupEvent($"load-finished: snapshot={_currentSnapshotId}, bars={_bars.Count}, label={CurrentDataOnStrategyText.Text}, chartChildren={ChartCanvas.Children.Count}");
+                return;
+            }
+            if (attempt < 3) await Task.Delay(300);
+        }
+        RecordStartupEvent($"load-exhausted: snapshot={_currentSnapshotId ?? "<none>"}, bars={_bars.Count}");
+    }
+
+    internal void RecordStartupEvent(string message)
+    {
+        try
+        {
+            var path = Path.Combine(_store.RootDirectory, "startup-load.log");
+            File.AppendAllText(path, $"{DateTimeOffset.Now:O} pid={Environment.ProcessId} {message}{Environment.NewLine}", new UTF8Encoding(false));
+        }
+        catch { }
     }
 
     private void TqSaveButton_Click(object sender, RoutedEventArgs e)
@@ -770,6 +802,23 @@ public partial class MainWindow : Window
         catch (Exception ex) { SetStatus("加载快照失败：" + ex.Message); AppendLog(ex.ToString()); }
     }
 
+    private async void LoadMainContinuousButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (!await _contextGate.WaitAsync(0)) { SetStatus("已有研究上下文任务运行中"); return; }
+        try
+        {
+            var snapshot = _store.GetSnapshots().FirstOrDefault(item =>
+                string.Equals(item.Symbol, "KQ.m@CZCE.SR", StringComparison.OrdinalIgnoreCase) && item.Period == "15m");
+            if (snapshot is null) { SetStatus("当前数据目录没有白糖主连 15 分钟快照，请先导入主连 CSV。"); return; }
+            await LoadSnapshotAsync(snapshot.SnapshotId);
+            if (_strategyDescriptor is null && !await LoadStrategyAsync(resetParameters: true)) return;
+            WorkflowTabs.SelectedIndex = 1;
+            SetStatus("已加载白糖主连；选择策略和区间后，点击“开始主连研究回测”。");
+        }
+        catch (Exception ex) { SetStatus("加载白糖主连失败：" + ex.Message); }
+        finally { _contextGate.Release(); }
+    }
+
     private void RefreshSnapshotList()
     {
         try
@@ -784,8 +833,14 @@ public partial class MainWindow : Window
         catch (Exception ex) { AppendLog("读取本地快照清单失败：" + ex.Message); }
     }
 
+    private void RefreshSnapshotOptions_OnDropDownOpened(object sender, EventArgs e) => RefreshSnapshotList();
+
     private void UpdateCurrentDataSelection()
     {
+        UpdateBacktestRangeAvailability();
+        if (MainContinuousResearchNoticeBorder is not null)
+            MainContinuousResearchNoticeBorder.Visibility = _currentSnapshotInfo?.IsMainContinuous == true ? Visibility.Visible : Visibility.Collapsed;
+        SetBacktestButtonKind(string.Equals(_strategyDescriptor?.Kind, "trade", StringComparison.OrdinalIgnoreCase));
         if (_currentSnapshotInfo is null)
         {
             CurrentDataSelectionText.Text = "尚未加载数据；请从下方列表选择，或导入 CSV。";
@@ -798,7 +853,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        var summary = $"当前已加载：{_currentSnapshotInfo.Symbol} · {_currentSnapshotInfo.PeriodDisplayName} · {_currentSnapshotInfo.FirstTimestamp:yyyy-MM-dd HH:mm}～{_currentSnapshotInfo.LastTimestamp:yyyy-MM-dd HH:mm} · {_currentSnapshotInfo.RowCount:N0} 根";
+        var summary = $"当前已加载：{_currentSnapshotInfo.SeriesDisplayName} · {_currentSnapshotInfo.PeriodDisplayName} · {_currentSnapshotInfo.FirstTimestamp:yyyy-MM-dd HH:mm}～{_currentSnapshotInfo.LastTimestamp:yyyy-MM-dd HH:mm} · {_currentSnapshotInfo.RowCount:N0} 根";
         CurrentDataSelectionText.Text = summary;
         CurrentDataOnStrategyText.Text = summary;
         DataStatusText.Text = $"{_currentSnapshotInfo.Symbol} · {_currentSnapshotInfo.PeriodDisplayName} · {_currentSnapshotInfo.RowCount:N0} 根";
@@ -807,10 +862,10 @@ public partial class MainWindow : Window
         try
         {
             var candidates = _store.GetSnapshots()
-                .Where(item => string.Equals(item.Symbol, _currentSnapshotInfo.Symbol, StringComparison.OrdinalIgnoreCase))
-                .GroupBy(item => item.Period, StringComparer.OrdinalIgnoreCase)
-                .Select(group => group.First())
-                .OrderBy(item => item.Period, StringComparer.OrdinalIgnoreCase)
+                .GroupBy(item => $"{item.Symbol}\u001f{item.Period}", StringComparer.OrdinalIgnoreCase)
+                .Select(group => group.FirstOrDefault(item => item.SnapshotId == _currentSnapshotInfo.SnapshotId) ?? group.First())
+                .OrderBy(item => item.Symbol, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(item => item.Period, StringComparer.OrdinalIgnoreCase)
                 .ToArray();
             _syncingPeriodSwitch = true;
             StrategyPeriodCombo.ItemsSource = candidates;
@@ -832,13 +887,13 @@ public partial class MainWindow : Window
             _syncingPeriodSwitch = true;
             StrategyPeriodCombo.SelectedItem = _currentSnapshotInfo;
             _syncingPeriodSwitch = false;
-            SetStatus("当前已有回测或数据任务运行，请完成后再切换周期");
+            SetStatus("当前已有回测或数据任务运行，请完成后再切换合约或周期");
             return;
         }
         try
         {
             await LoadSnapshotAsync(snapshot.SnapshotId);
-            SetStatus($"已自动切换：{snapshot.Symbol} · {snapshot.PeriodDisplayName} · {snapshot.RowCount:N0} 根");
+            SetStatus($"已切换到：{snapshot.Symbol} · {snapshot.PeriodDisplayName} · {snapshot.FirstTimestamp:yyyy-MM-dd}～{snapshot.LastTimestamp:yyyy-MM-dd}");
         }
         catch (Exception ex)
         {
@@ -933,16 +988,17 @@ public partial class MainWindow : Window
         var card = fileName switch
         {
             "sma_ema_cross_trade.py" => ("快慢均线交叉时产生开仓/反向意图；成交、费用和权益由本地交易回放模拟。", "类型：交易　结果：本地模拟成交、手续费和盈亏"),
-            "ema_dynamic_long_trade.py" => ("EMA 趋势成立后按 EMA 参考价挂多头限价单；未触及的订单逐根撤销重挂，止损与动态保本按下一根有效 K 线开盘模拟。", "类型：交易　限价触发＋本地模拟成交、手续费和盈亏"),
+            "ema_dynamic_long_trade.py" => ("EMA 趋势成立后按 EMA 参考价挂多头限价单；未触及的订单逐根撤销重挂；按 ATR 初始止损距离与风险预算自动算手数，保护价从下一根起盘中有效，触及按保护价扣滑点，跳空按较差开盘价扣滑点。", "类型：交易　风险定量限价开仓＋本地模拟成交、手续费和盈亏"),
+            "ema_dynamic_short_trade.py" => ("EMA21<EMA55且收盘<EMA55，EMA55卖出限价；主选ATR14×2、每波3次、1R启用EMA21退出、4R起锁n−1R。仅15分钟研究主选。", "类型：交易　空头独立参数研究"),
             "period_signal.py" => ("指标预热完成后产生测试信号，适合检查数据、预热和回放链路。", "类型：信号　结果：只看信号，不生成成交和盈亏"),
             _ => ("快慢均线交叉时产生做多/做空信号；只做信号研究，不产生成交。", "类型：信号　结果：只看信号，不生成成交和盈亏")
         };
         StrategyCardText.Text = card.Item1;
         StrategyCardMetaText.Text = card.Item2;
-        StrategyRunMeaningText.Text = fileName is "sma_ema_cross_trade.py" or "ema_dynamic_long_trade.py"
+        StrategyRunMeaningText.Text = fileName is "sma_ema_cross_trade.py" or "ema_dynamic_long_trade.py" or "ema_dynamic_short_trade.py"
             ? "交易策略：会进入本地模拟成交，并计算手续费、净利和权益；不会向真实账户下单。"
             : "信号策略：只产生研究信号，不产生成交、手续费或盈亏。";
-        SetBacktestButtonKind(fileName is "sma_ema_cross_trade.py" or "ema_dynamic_long_trade.py");
+        SetBacktestButtonKind(fileName is "sma_ema_cross_trade.py" or "ema_dynamic_long_trade.py" or "ema_dynamic_short_trade.py");
     }
 
     private void UpdateStrategyCardFromDescriptor()
@@ -956,6 +1012,8 @@ public partial class MainWindow : Window
             : "信号策略：只产生研究信号，不产生成交、手续费或盈亏。";
         SetBacktestButtonKind(kind == "交易");
         UpdateLiveStrategySelectionSummary();
+        UpdateTradingRules();
+        DrawChart();
     }
 
     private int CurrentStrategyWarmupBars()
@@ -971,6 +1029,8 @@ public partial class MainWindow : Window
         var strategyFileName = Path.GetFileName(_strategyDescriptor.StrategyPath);
         var targetItem = StrategyPresetCombo.Items.OfType<ComboBoxItem>()
             .FirstOrDefault(item => string.Equals(item.Tag?.ToString(), strategyFileName, StringComparison.OrdinalIgnoreCase));
+        if (targetItem is null && _strategyDescriptor.Parameters.ContainsKey("entry_ema_period") && _strategyDescriptor.Parameters.ContainsKey("risk_budget"))
+            targetItem = StrategyPresetCombo.Items.OfType<ComboBoxItem>().FirstOrDefault(item => item.Tag?.ToString() == (_strategyDescriptor.Name.Contains("做空", StringComparison.Ordinal) ? "ema_dynamic_short_trade.py" : "ema_dynamic_long_trade.py"));
         if (targetItem is null && string.Equals(_strategyDescriptor.Kind, "trade", StringComparison.OrdinalIgnoreCase))
             targetItem = StrategyPresetCombo.Items.OfType<ComboBoxItem>().FirstOrDefault(item => item.Tag?.ToString() == "sma_ema_cross_trade.py");
         if (targetItem is null || ReferenceEquals(StrategyPresetCombo.SelectedItem, targetItem)) return;
@@ -995,7 +1055,9 @@ public partial class MainWindow : Window
     private void SetBacktestButtonKind(bool isTrade)
     {
         if (StartBacktestButton is null) return;
-        StartBacktestButton.Content = isTrade ? "开始模拟交易回测（有盈亏）" : "开始信号回放（无盈亏）";
+        StartBacktestButton.Content = isTrade
+            ? (_currentSnapshotInfo?.IsMainContinuous == true ? "开始主连研究回测（模拟盈亏）" : "开始模拟交易回测（有盈亏）")
+            : "开始信号回放（无盈亏）";
     }
 
     private void BuildStrategyParameterForm()
@@ -1006,6 +1068,7 @@ public partial class MainWindow : Window
         if (_strategyDescriptor is null)
         {
             StrategyParameterFormHint.Text = "加载策略后显示参数默认值和范围。";
+            UpdateBacktestRangeAvailability();
             return;
         }
         var configuredValues = ReadConfiguredStrategyParameters();
@@ -1023,9 +1086,20 @@ public partial class MainWindow : Window
                 var parameter = pair.Value;
                 if (parameter.Choices is { Count: > 0 })
                 {
-                    var combo = new ComboBox { Height = 30, ToolTip = $"{pair.Key}；可选值：{string.Join(", ", parameter.Choices.Select(FormatParameterValue))}" };
-                    foreach (var choice in parameter.Choices) combo.Items.Add(new ComboBoxItem { Content = FormatParameterValue(choice), Tag = choice });
-                    var configuredText = configuredValues.TryGetValue(pair.Key, out var configured) ? FormatParameterValue(configured) : FormatParameterValue(parameter.Default);
+                    string ChoiceLabel(JsonElement value) => pair.Key == "protection_variant"
+                        ? value.GetString() switch
+                        {
+                            "current" => "现有保护规则",
+                            "two_r_old_ladder" => "2R保本＋现有阶梯",
+                            "two_r_n_minus_one" => "2R保本＋按所设阈值锁n−1R",
+                            _ => FormatParameterValue(value)
+                        }
+                        : pair.Key == "ema_exit_period"
+                        ? value.GetInt32() switch { 0 => "不启用均线止盈", 21 => "EMA21", 55 => "EMA55", _ => FormatParameterValue(value) }
+                        : FormatParameterValue(value);
+                    var combo = new ComboBox { Height = 30, ToolTip = $"{pair.Key}；可选值：{string.Join("、", parameter.Choices.Select(ChoiceLabel))}" };
+                    foreach (var choice in parameter.Choices) combo.Items.Add(new ComboBoxItem { Content = ChoiceLabel(choice), Tag = choice });
+                    var configuredText = configuredValues.TryGetValue(pair.Key, out var configured) ? ChoiceLabel(configured) : ChoiceLabel(parameter.Default);
                     combo.SelectedItem = combo.Items.OfType<ComboBoxItem>().FirstOrDefault(item => string.Equals(item.Content?.ToString(), configuredText, StringComparison.OrdinalIgnoreCase)) ?? combo.Items[0];
                     combo.SelectionChanged += (_, _) => SyncParametersJsonFromForm();
                     _strategyParameterComboBoxes[pair.Key] = combo;
@@ -1044,7 +1118,10 @@ public partial class MainWindow : Window
                 StrategyParameterFormPanel.Children.Add(row);
             }
             var usesBarCounts = _strategyDescriptor.Parameters.Keys.Any(name => name is "fast_period" or "slow_period" or "period");
-            StrategyParameterFormHint.Text = usesBarCounts
+            var usesRiskSizing = _strategyDescriptor.Parameters.ContainsKey("risk_budget");
+            StrategyParameterFormHint.Text = usesRiskSizing
+                ? "每个 EMA 阶段按次数上限开仓；输入 0 表示不限次数。趋势条件反向后次数重置，未成交改单不计次数。达到所设 R 后，可启用 EMA21/55 收盘确认退出，下一根有效 K 线开盘平仓。手数按风险预算÷（初始止损点数×合约乘数）向下取整，不在开仓时预留手续费；移动保护止损时才加双向手续费和设定的点数缓冲。跳空可能超预算。"
+                : usesBarCounts
                 ? "快线/慢线等参数单位是 K 线根数，不是分钟；当前选 15/30/60 分钟周期后，根数对应不同实际时长。"
                 : "表单值会转换为策略 JSON；范围和类型以策略声明为准。";
         }
@@ -1053,6 +1130,7 @@ public partial class MainWindow : Window
             _syncingStrategyParameterForm = false;
         }
         SyncParametersJsonFromForm();
+        UpdateBacktestRangeAvailability();
     }
 
     private Dictionary<string, JsonElement> ReadConfiguredStrategyParameters()
@@ -1070,6 +1148,20 @@ public partial class MainWindow : Window
 
     private static string ParameterDisplayName(string name) => name switch
     {
+        "min_tick" => "最小跳动",
+        "dynamic_fee_offset_points" => "手续费缓冲下限（点）",
+        "ema_period" => "快 EMA 根数",
+        "trend_ema_period" => "趋势 EMA 根数",
+        "entry_ema_period" => "入场 EMA 根数",
+        "atr_period" => "ATR 根数",
+        "atr_stop_multiplier" => "初始止损 ATR 倍数",
+        "profit_lock_start_r" => "开始锁 n−1R 的盈利阈值",
+        "protection_variant" => "止盈保护规则",
+        "max_entries_per_trend" => "每趋势最多入场次数",
+        "ema_exit_period" => "均线止盈线",
+        "ema_exit_activation_r" => "盈利达到多少 R 后启用均线止盈",
+        "risk_budget" => "单笔风险预算（元）",
+        "contract_multiplier" => "合约乘数（吨/手）",
         "fast_period" => "快线根数",
         "slow_period" => "慢线根数",
         "average" => "均线类型",
@@ -1118,6 +1210,7 @@ public partial class MainWindow : Window
             StrategyParameterFormHint.Text = "参数表单暂未生成有效 JSON：" + ex.Message;
         }
         finally { _syncingStrategyParameterForm = false; }
+        DrawChart();
     }
 
     private static JsonElement ParseParameterValue(string raw, string type)
@@ -1133,7 +1226,292 @@ public partial class MainWindow : Window
 
     private void StrategyParametersText_TextChanged(object sender, TextChangedEventArgs e)
     {
+        UpdateBacktestRangeAvailability();
+        UpdateTradingRules();
     }
+
+    private void TradingRulesConfig_TextChanged(object sender, TextChangedEventArgs e) => UpdateTradingRules();
+
+    private bool _syncingBacktestRange;
+
+    private void BacktestRangeCanonical_TextChanged(object sender, TextChangedEventArgs e)
+    {
+        if (_syncingBacktestRange || BacktestStartDatePicker is null || BacktestEndDatePicker is null ||
+            BacktestStartTimeText is null || BacktestEndTimeText is null || BacktestRangeErrorText is null) return;
+        _syncingBacktestRange = true;
+        try
+        {
+            var isStart = ReferenceEquals(sender, StartInclusiveText);
+            var datePicker = isStart ? BacktestStartDatePicker : BacktestEndDatePicker;
+            var timeText = isStart ? BacktestStartTimeText : BacktestEndTimeText;
+            if (DateTimeOffset.TryParse(((TextBox)sender).Text, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var value))
+            {
+                var beijing = value.ToOffset(TimeSpan.FromHours(8));
+                datePicker.SelectedDate = beijing.Date;
+                timeText.Text = beijing.ToString(beijing.Ticks % TimeSpan.TicksPerMinute == 0 ? "HH:mm" : "HH:mm:ss.FFFFFFF", CultureInfo.InvariantCulture);
+            }
+            else
+            {
+                datePicker.SelectedDate = null;
+                timeText.Text = "";
+            }
+        }
+        finally { _syncingBacktestRange = false; }
+        UpdateBacktestRangeError();
+        UpdateTradingRules();
+    }
+
+    private void BacktestRangeDate_SelectedDateChanged(object? sender, SelectionChangedEventArgs e) => UpdateBacktestRangeFromEditor();
+    private void BacktestRangeTime_TextChanged(object sender, TextChangedEventArgs e) => UpdateBacktestRangeFromEditor();
+
+    private void BacktestRangeDate_DateValidationError(object sender, DatePickerDateValidationErrorEventArgs e)
+    {
+        e.ThrowException = false;
+        ((DatePicker)sender).SelectedDate = null;
+        UpdateBacktestRangeFromEditor();
+    }
+
+    private static bool TryReadBacktestTimestamp(DatePicker datePicker, TextBox timeText, out DateTimeOffset value)
+    {
+        value = default;
+        if (datePicker.SelectedDate is not { } date || !TimeOnly.TryParseExact(timeText.Text.Trim(),
+            ["HH:mm", "HH:mm:ss", "HH:mm:ss.FFFFFFF"], CultureInfo.InvariantCulture, DateTimeStyles.None, out var time)) return false;
+        value = new DateTimeOffset(date.Date + time.ToTimeSpan(), TimeSpan.FromHours(8));
+        return true;
+    }
+
+    private bool TryReadBacktestRange(out DateTimeOffset start, out DateTimeOffset end, out string error)
+    {
+        start = end = default;
+        error = "";
+        if (!TryReadBacktestTimestamp(BacktestStartDatePicker, BacktestStartTimeText, out start))
+            error = "请选择开始日期，时间按时:分填写，例如 09:00。";
+        else if (!TryReadBacktestTimestamp(BacktestEndDatePicker, BacktestEndTimeText, out end))
+            error = "请选择结束日期，时间按时:分填写，例如 15:00。";
+        else if (end <= start) error = "结束时间必须晚于开始时间。";
+        return error.Length == 0;
+    }
+
+    private void UpdateBacktestRangeFromEditor()
+    {
+        if (_syncingBacktestRange || BacktestStartDatePicker is null || BacktestEndDatePicker is null ||
+            BacktestStartTimeText is null || BacktestEndTimeText is null || StartInclusiveText is null || EndExclusiveText is null) return;
+        _syncingBacktestRange = true;
+        try
+        {
+            StartInclusiveText.Text = TryReadBacktestTimestamp(BacktestStartDatePicker, BacktestStartTimeText, out var start) ? start.ToString("O", CultureInfo.InvariantCulture) : "";
+            EndExclusiveText.Text = TryReadBacktestTimestamp(BacktestEndDatePicker, BacktestEndTimeText, out var end) ? end.ToString("O", CultureInfo.InvariantCulture) : "";
+        }
+        finally { _syncingBacktestRange = false; }
+        UpdateBacktestRangeError();
+        UpdateTradingRules();
+    }
+
+    private void UpdateBacktestRangeError()
+    {
+        var valid = TryReadBacktestRange(out _, out _, out var error);
+        BacktestRangeErrorText.Text = error;
+        BacktestRangeErrorText.Visibility = valid || (BacktestStartDatePicker.SelectedDate is null && BacktestEndDatePicker.SelectedDate is null &&
+            BacktestStartTimeText.Text.Length == 0 && BacktestEndTimeText.Text.Length == 0) ? Visibility.Collapsed : Visibility.Visible;
+    }
+
+    private void ResetBacktestRangeButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_bars.Count == 0) { SetStatus("请先加载行情数据，再恢复默认区间。"); return; }
+        try { SetDefaultReplayRange(); SetStatus("已填入推荐区间：从策略预热后的第一根 K 线到当前数据末尾。"); }
+        catch (Exception ex) { SetStatus($"无法恢复回测区间：{ex.Message}"); }
+    }
+
+    private async void ResearchFinal_Click(object sender, RoutedEventArgs e)
+    {
+        if (!await _contextGate.WaitAsync(0)) { SetStatus("已有研究上下文任务运行中"); return; }
+        try
+        {
+            var role = (sender as Button)?.Tag?.ToString();
+            await ApplyFinalMainAsync(role == "short55");
+        }
+        finally { _contextGate.Release(); }
+    }
+
+    private async Task<bool> ApplyFinalMainAsync(bool isShort)
+    {
+        var researchSnapshotId = _currentSnapshotInfo?.IsMainContinuous == true ? _currentSnapshotId : null;
+        var resetResearchRange = researchSnapshotId is not null && _strategyDescriptor is null;
+        var researchStart = StartInclusiveText.Text;
+        var researchEnd = EndExclusiveText.Text;
+        var runId = FinalMainRunId(isShort);
+        if (!await OpenTradeRunAsync(runId)) return false;
+        // Restore the validated account/range first, then use the installed current strategy.
+        // Clear the read-only result so Start Backtest creates a run on its first click.
+        ClearSignalContext();
+        if (researchSnapshotId is not null)
+        {
+            await LoadSnapshotAsync(researchSnapshotId, setDefaultRange: false);
+            StartInclusiveText.Text = researchStart;
+            EndExclusiveText.Text = researchEnd;
+        }
+        _restoringRunView = true;
+        try { StrategyPathText.Text = Path.Combine(AppContext.BaseDirectory, "strategies", isShort ? "ema_dynamic_short_trade.py" : "ema_dynamic_long_trade.py"); }
+        finally { _restoringRunView = false; }
+        if (!await LoadStrategyAsync(resetParameters: false)) return false;
+        if (resetResearchRange) SetDefaultReplayRange();
+        SyncStrategyPresetSelectionToDescriptor();
+        WorkflowTabs.SelectedIndex = 1;
+        ResultTabs.SelectedIndex = 0;
+        TradingRulesExpander.IsExpanded = true;
+        UpdateTradingRules();
+        var config = JsonSerializer.Deserialize<TradingConfig>(TradeConfigText.Text, new JsonSerializerOptions { PropertyNameCaseInsensitive = true, Converters = { new JsonStringEnumConverter() } }) ?? new TradingConfig();
+        config = config with { InitialEquity = 2_000_000m };
+        TradeInitialEquityText.Text = config.InitialEquity.ToString(CultureInfo.InvariantCulture);
+        TradeConfigText.Text = JsonSerializer.Serialize(config, new JsonSerializerOptions { WriteIndented = false, Converters = { new JsonStringEnumConverter() } });
+        UpdateTradingRules();
+        SetStatus($"已应用15分钟{(isShort ? "空头" : "多头")}主选：初始权益200万、风险预算按参数表、1跳滑点；点击开始回测生成新结果");
+        return true;
+    }
+
+    private string FinalMainRunId(bool isShort)
+    {
+        var manifest = Path.Combine(_store.RootDirectory, "multiside-research-20261008", "final-main-release.json");
+        if (File.Exists(manifest))
+        {
+            using var json = JsonDocument.Parse(File.ReadAllText(manifest));
+            if (json.RootElement.TryGetProperty("verified_runs", out var runs) && runs.TryGetProperty(isShort ? "short" : "long", out var run))
+                return run.GetString()!;
+        }
+        return isShort ? "trd-20261008153346914-c4433d037" : "trd-20261008151236152-fab7280c0";
+    }
+
+    private void ResearchReport_Click(object sender, RoutedEventArgs e)
+    {
+        var report = Path.Combine(_store.RootDirectory, "multiside-research-20261008", "白糖多空投研定稿.html");
+        if (!File.Exists(report)) { SetStatus("当前数据目录没有多空投研报告：" + report); return; }
+        Process.Start(new ProcessStartInfo(report) { UseShellExecute = true });
+    }
+
+    private void UpdateTradingRules()
+    {
+        if (TradingRulesText is null || TradingRulesContextText is null || TradingRulesExpander is null) return;
+        var isEmaStrategy = _strategyDescriptor?.Parameters.ContainsKey("entry_ema_period") == true
+            && _strategyDescriptor.Parameters.ContainsKey("risk_budget");
+        TradingRulesExpander.Visibility = isEmaStrategy || _strategyDescriptor is null ? Visibility.Visible : Visibility.Collapsed;
+        if (!isEmaStrategy)
+        {
+            TradingRulesContextText.Text = "尚未加载 EMA 做多策略";
+            TradingRulesText.Text = "默认主选：ATR14×2、风险金1000元、每波1次、2R保本、3R启用EMA55退出、4R起锁n−1R。加载策略后显示完整实际条件。";
+            BacktestConfigurationStatusText.Text = "加载交易策略后会显示配置状态；参数改变后必须重新回测才会更新结果。";
+            return;
+        }
+        try
+        {
+            var isShort = _strategyDescriptor!.Name.Contains("做空", StringComparison.Ordinal);
+            var side = isShort ? "做空" : "做多";
+            var values = SignalReplayRunner.ValidateParameters(_strategyDescriptor!, BuildParametersOrDefaults());
+            decimal Number(string key, decimal fallback) => values.TryGetValue(key, out var value) ? value.GetDecimal() : fallback;
+            string Text(string key, string fallback) => values.TryGetValue(key, out var value) ? value.GetString() ?? fallback : fallback;
+            string N(decimal value) => value.ToString("0.####", CultureInfo.InvariantCulture);
+            var fast = Number("ema_period", 21); var slow = Number("trend_ema_period", 55);
+            var entry = Number("entry_ema_period", 55); var atr = Number("atr_period", 14);
+            var atrMultiple = Number("atr_stop_multiplier", 2); var lockR = Number("profit_lock_start_r", 3);
+            var cap = Number("max_entries_per_trend", 1); var exitEma = Number("ema_exit_period", 0);
+            var activation = Number("ema_exit_activation_r", 2); var offset = Number("dynamic_fee_offset_points", 1);
+            var budget = Number("risk_budget", 1000); var multiplier = Number("contract_multiplier", 10);
+            var tick = Number("min_tick", 1);
+            var variant = Text("protection_variant", "current");
+            var config = JsonSerializer.Deserialize<TradingConfig>(TradeConfigText.Text,
+                new JsonSerializerOptions { PropertyNameCaseInsensitive = true, Converters = { new JsonStringEnumConverter() } }) ?? new TradingConfig();
+            config.Validate();
+            var visibleEquity = decimal.TryParse(TradeInitialEquityText.Text, NumberStyles.Number, CultureInfo.InvariantCulture, out var parsedEquity)
+                ? parsedEquity : config.InitialEquity;
+            var main = fast == 21 && slow == 55 && entry == 55 && atr == 14 && atrMultiple == 2
+                && lockR == 4 && (isShort ? cap == 3 && exitEma == 21 && activation == 1 : cap == 1 && exitEma == 55 && activation == 3) && budget == 1000
+                && offset == 1 && multiplier == 10 && tick == 1 && variant == "two_r_n_minus_one";
+            var context = main ? side + "15分钟主选参数" : "EMA 动态委托" + side + " · 当前自定义参数";
+            if (main && _bars.Count > 0 && _bars[0].Period != "15m") context += " · 当前周期不是15分钟，不属于主选验证范围";
+            if (_activeTradeRecord is { } run)
+            {
+                var sameParameters = run.Parameters.Count == values.Count && run.Parameters.All(pair =>
+                    values.TryGetValue(pair.Key, out var value) &&
+                    (pair.Value.ValueKind == JsonValueKind.Number && value.ValueKind == JsonValueKind.Number
+                        ? pair.Value.GetDecimal() == value.GetDecimal() : pair.Value.ToString() == value.ToString()));
+                var sameRange = DateTimeOffset.TryParse(StartInclusiveText.Text, out var start) && start == run.StartInclusive
+                    && DateTimeOffset.TryParse(EndExclusiveText.Text, out var end) && end == run.EndExclusive;
+                var sameConfig = sameParameters && config == run.Config && visibleEquity == run.Config.InitialEquity && sameRange && run.SnapshotId == _currentSnapshotId;
+                context += sameConfig
+                    ? $" · 与回测 {run.RunId} 保存配置一致"
+                    : $" · 当前配置已修改，尚未重跑；图中成交及盈亏仍来自 {run.RunId}";
+                BacktestConfigurationStatusText.Text = sameConfig
+                    ? $"当前图表和成交与参数、资金一致（{run.RunId}）。"
+                    : $"参数或资金已修改，图表和成交仍是旧结果（{run.RunId}）；请点下方开始回测更新。";
+                BacktestConfigurationStatusBorder.Background = sameConfig ? new SolidColorBrush(Color.FromRgb(236, 253, 243)) : new SolidColorBrush(Color.FromRgb(255, 250, 235));
+                BacktestConfigurationStatusBorder.BorderBrush = sameConfig ? new SolidColorBrush(Color.FromRgb(108, 233, 166)) : new SolidColorBrush(Color.FromRgb(254, 200, 75));
+                BacktestConfigurationStatusText.Foreground = sameConfig ? new SolidColorBrush(Color.FromRgb(2, 122, 72)) : new SolidColorBrush(Color.FromRgb(147, 55, 13));
+            }
+            else
+            {
+                context += " · 待回测配置";
+                BacktestConfigurationStatusText.Text = "尚无本次参数的回测结果；开始回测后才会更新图表和成交。";
+                BacktestConfigurationStatusBorder.Background = new SolidColorBrush(Color.FromRgb(255, 250, 235));
+                BacktestConfigurationStatusBorder.BorderBrush = new SolidColorBrush(Color.FromRgb(254, 200, 75));
+                BacktestConfigurationStatusText.Foreground = new SolidColorBrush(Color.FromRgb(147, 55, 13));
+            }
+            var oldStrategyResult = _activeTradeRecord is { StrategyVersion: not "1.5.1" };
+            if (oldStrategyResult) context += " · 旧手数/保护触发口径，需按当前策略重跑";
+            TradingRulesContextText.Text = context;
+            StrategyCardText.Text = main ? $"白糖15分钟{side}主选 · EMA55限价" : _strategyDescriptor!.Name;
+            StrategyCardMetaText.Text = $"仅{side} · ATR{N(atr)}×{N(atrMultiple)} · 风险金 {N(budget)} 元 · 每波{(cap == 0 ? "不限" : "最多" + N(cap) + "次")}{Environment.NewLine}"
+                + (variant == "two_r_n_minus_one" ? $"2R保本 · {N(lockR)}R起锁n−1R" : "按所选阶梯保护")
+                + (exitEma == 0 ? " · 无均线退出" : $" · {N(activation)}R后启用EMA{N(exitEma)}退出");
+
+            var rules = new StringBuilder();
+            if (oldStrategyResult) rules.AppendLine("当前图表与交易使用旧手数或保护触发口径。以下按当前策略说明；请重新回测以更新结果，旧记录保留供核对。");
+            rules.AppendLine(CurrentMarketSummary());
+            rules.AppendLine($"正式区间（北京时间，起点包含、终点不含）：{StartInclusiveText.Text} ～ {EndExclusiveText.Text}");
+            rules.AppendLine($"指标预热：{CurrentStrategyWarmupBars()} 根；只使用已完成K线，方向仅{side}。");
+            rules.AppendLine();
+            rules.AppendLine("① 开仓与每波次数");
+            rules.AppendLine(isShort ? $"空仓时，EMA{N(fast)} < EMA{N(slow)}，且本根收盘价 < EMA{N(slow)}，才允许挂卖出限价空单。" : $"空仓时，EMA{N(fast)} > EMA{N(slow)}，且本根收盘价 > EMA{N(slow)}，才允许挂多单。");
+            rules.AppendLine(isShort ? $"每波定义：EMA{N(fast)} < EMA{N(slow)}连续阶段，最多成交入场{(cap == 0 ? "不限次数" : N(cap) + "次")}；EMA{N(fast)} ≥ EMA{N(slow)}重置。仅成交计次，不在持仓中加仓；每波累计风险可超过单笔预算。" : $"每波定义：EMA{N(fast)} > EMA{N(slow)} 的连续阶段；最多成交入场 {(cap == 0 ? "不限次数" : N(cap) + "次")}。EMA{N(fast)} ≤ EMA{N(slow)} 后重置次数。成交才计次，撤单重挂不计次；持仓期间不加仓。");
+            rules.AppendLine($"本根收盘按 EMA{N(entry)} 四舍五入至 {N(tick)} 点价格网格挂限价单，只在下一根有效K线尝试成交；未成交失效，下一根收盘按最新EMA重新判断并重挂。");
+            rules.AppendLine(isShort ? $"下一根开盘≥限价：成交价=max(开盘−{config.SlippageTicks}×{config.MinTick}，限价)；否则最高价≥限价时按限价成交。不在信号当根成交。" : $"下一根开盘≤限价：成交价=min(开盘＋{config.SlippageTicks}×{config.MinTick}，限价)；否则仅当最低价≤限价时按限价成交。不会按生成信号的当根K线成交。");
+            rules.AppendLine();
+            rules.AppendLine("② 以损定量与初始止损");
+            rules.AppendLine($"初始权益 {visibleEquity:N0} 元；单笔风险预算 {budget:N0} 元。");
+            rules.AppendLine(isShort ? $"计划止损=限价＋ATR{N(atr)}×{N(atrMultiple)}，向上对齐{N(tick)}点网格；计划手数=floor[{N(budget)}÷(计划止损点数×{N(multiplier)})]，不足1手跳过。开仓手数不预留手续费。" : $"计划止损=限价−ATR{N(atr)}×{N(atrMultiple)}，向下对齐 {N(tick)} 点网格；计划手数=向下取整[{N(budget)}÷(计划止损点数×{N(multiplier)})]。开仓手数不预留手续费，不足1手则跳过。");
+            rules.AppendLine($"手数倍率={config.Lots}（主选保持1）；实际手数=计划手数×倍率。按乘数 {config.Multiplier}、保证金率 {config.MarginRate:P0} 检查余额，保证金或手续费不足则不成交。");
+            rules.AppendLine(isShort ? $"成交后用成交价＋信号K线ATR{N(atr)}×{N(atrMultiple)}并向上对齐初始止损；冻结R=初始止损−成交价，最少{N(tick)}点。R不随后续ATR变化；成交当根不管理新仓。" : $"成交后用成交价−信号K线ATR{N(atr)}×{N(atrMultiple)} 重算并向下对齐初始止损；冻结 R=成交价−该初始止损，最少 {N(tick)} 点。R不随后续ATR变化。成交当根不检查新仓止损/止盈。");
+            rules.AppendLine();
+            rules.AppendLine("③ 动态保护与均线退出");
+            var maxCloseFee = Math.Max(config.TodayCloseFee, config.OrdinaryCloseFee);
+            var feeOffsetRule = config.FeeMode == TradingFeeMode.Fixed
+                ? $"F=max[(开仓费{N(config.OpenFee)}＋较高平仓费{N(maxCloseFee)})÷乘数{N(config.Multiplier)}，参数下限{N(offset)}点]"
+                : $"F=max[(入场价＋目标价)×费率{N(config.FeeRate)}，参数下限{N(offset)}点]";
+            rules.AppendLine(isShort ? $"达到nR按已完成K线最低价L ≤ 开仓价−nR判断；只有移动保护价时才加费用缓冲F：{feeOffsetRule}；保护向下对齐{N(tick)}点，只降不升。" : $"达到nR按已完成K线最高价H ≥ 开仓价＋nR判断；只有移动保护价时才加费用缓冲F：{feeOffsetRule}；保护价向上对齐 {N(tick)} 点网格，只上移、不下移。");
+            if (variant == "two_r_n_minus_one")
+                rules.AppendLine(isShort ? $"达到2R：保护降到开仓价−F；达到{N(lockR)}R起锁n−1R，保护价=开仓价−(n−1)R−F。" : $"达到2R：保护移到开仓价＋F；达到{N(lockR)}R起按n−1R锁盈（{N(lockR)}R→{N(lockR - 1)}R、{N(lockR + 1)}R→{N(lockR)}R……），保护价=开仓价＋(n−1)R＋F。");
+            else
+                rules.AppendLine(isShort ? $"达到{(variant == "two_r_old_ladder" ? "2" : "1")}R：保护降至开仓价−F；4～10R锁n−3R，11R起锁n−1R。" : $"达到{(variant == "two_r_old_ladder" ? "2" : "1")}R：保护移到开仓价＋F；4～10R按n−3R锁盈，11R起按n−1R锁盈。");
+            rules.AppendLine(exitEma == 0 ? "未启用均线退出。"
+                : $"价格达到{N(activation)}R后启用EMA{N(exitEma)}退出（不加保护价费用缓冲），持续至平仓；从下一根完整K线起，收盘价严格{(isShort ? "高于" : "低于")}该根EMA时生成全仓平仓信号。启用并不保证实际盈利。");
+            rules.AppendLine(isShort ? "每根K线撮合此前已生效的保护单：最高价≥保护价时盘中退出，再检查已启用的EMA收盘退出。随后按本根最低价更新保护和启用状态，新条件下一根生效。" : $"每根K线撮合此前已生效的保护单：最低价≤保护价时盘中退出，再检查已启用的EMA收盘退出。随后才按本根最高价更新保护及启用状态，新条件从下一根K线起生效。");
+            rules.AppendLine($"保护退出：本根开盘与此前保护价取{(isShort ? "较高" : "较低")}价格，再{(isShort ? "＋" : "−")}{config.SlippageTicks}×{config.MinTick}全仓成交；开盘跳过保护价不会按更优保护价成交。EMA收盘退出：下一根有效K线开盘扣滑点。入场K线不回溯撮合保护，初始保护从下一根起有效。");
+            rules.AppendLine();
+            rules.AppendLine("④ 费用、指标算法与复盘口径");
+            rules.AppendLine(config.FeeMode == TradingFeeMode.Fixed
+                ? $"实际手续费：开仓 {config.OpenFee} 元/手；平今 {config.TodayCloseFee} 元/手；普通平仓 {config.OrdinaryCloseFee} 元/手，按数据中的交易日判断。"
+                : $"实际手续费按比例计收：成交金额×{config.FeeRate}；开仓手数不预留手续费，保护止损偏移按估算费率折算。");
+            rules.AppendLine($"开仓手数不扣手续费预留；只有推进动态保护止损时，才按开仓费＋较高平仓费折算双向费用，并加参数缓冲 {N(offset)} 点（白糖为1跳）。F不包含实际成交滑点；锁0R保护价覆盖双向手续费和1跳缓冲，跳空仍可能扩大亏损。手续费仍按实际成交在盈亏中扣除。");
+            rules.AppendLine("EMA：最初N根收盘价均值作种子，之后按2/(N+1)递推；ATR：TR=max(H−L,|H−前收|,|L−前收|)，最初N根TR均值作种子，之后按(旧ATR×(N−1)＋新TR)/N递推（Wilder）。休市不填虚拟K线，跨休市的价差会计入TR。");
+            rules.AppendLine($"额外固定止损价：{config.StopLossPrice?.ToString(CultureInfo.InvariantCulture) ?? "未启用"}；额外固定止盈价：{config.TakeProfitPrice?.ToString(CultureInfo.InvariantCulture) ?? "未启用"}（若启用，按收盘价触发并在下一根开盘退出）。");
+            rules.AppendLine("区间结束不强制平仓，剩余持仓按末根收盘价估值；K线OHLC无法还原根内路径。图上成交时间为成交K线结束时间，不是盘中精确成交时刻。");
+            TradingRulesText.Text = rules.ToString().TrimEnd();
+        }
+        catch (Exception ex)
+        {
+            TradingRulesContextText.Text = "当前配置尚不可用于复核";
+            TradingRulesText.Text = "请先修正参数或交易配置：" + ex.Message;
+        }
+    }
+
 
     private void ApplyAdvancedParametersButton_Click(object sender, RoutedEventArgs e)
     {
@@ -1148,12 +1526,13 @@ public partial class MainWindow : Window
                 if (!document.RootElement.TryGetProperty(pair.Key, out var value)) continue;
                 var formatted = FormatParameterValue(value);
                 if (_strategyParameterTextBoxes.TryGetValue(pair.Key, out var text)) text.Text = formatted;
-                if (_strategyParameterComboBoxes.TryGetValue(pair.Key, out var combo)) combo.SelectedItem = combo.Items.OfType<ComboBoxItem>().FirstOrDefault(item => string.Equals(item.Content?.ToString(), formatted, StringComparison.OrdinalIgnoreCase));
+                if (_strategyParameterComboBoxes.TryGetValue(pair.Key, out var combo)) combo.SelectedItem = combo.Items.OfType<ComboBoxItem>().FirstOrDefault(item => item.Tag is JsonElement choice && string.Equals(FormatParameterValue(choice), formatted, StringComparison.OrdinalIgnoreCase));
             }
             SetStatus("高级 JSON 已应用到参数表单");
         }
         catch (Exception ex) { SetStatus("高级参数 JSON 无效：" + ex.Message); }
         finally { _syncingStrategyParameterForm = false; }
+        DrawChart();
     }
 
     private void ApplyTradeFormButton_Click(object sender, RoutedEventArgs e)
@@ -1164,6 +1543,7 @@ public partial class MainWindow : Window
             config = config with
             {
                 Lots = int.Parse(TradeLotsText.Text, CultureInfo.InvariantCulture),
+                InitialEquity = decimal.Parse(TradeInitialEquityText.Text, CultureInfo.InvariantCulture),
                 OpenFee = decimal.Parse(TradeOpenFeeText.Text, CultureInfo.InvariantCulture),
                 OrdinaryCloseFee = decimal.Parse(TradeCloseFeeText.Text, CultureInfo.InvariantCulture),
                 SlippageTicks = int.Parse(TradeSlippageText.Text, CultureInfo.InvariantCulture)
@@ -1254,10 +1634,11 @@ public partial class MainWindow : Window
             _strategyParameterTextBoxes.Clear();
             _strategyParameterComboBoxes.Clear();
             var selectedFile = (StrategyPresetCombo?.SelectedItem as ComboBoxItem)?.Tag?.ToString();
-            SetBacktestButtonKind(selectedFile is "sma_ema_cross_trade.py" or "ema_dynamic_long_trade.py");
+            SetBacktestButtonKind(selectedFile is "sma_ema_cross_trade.py" or "ema_dynamic_long_trade.py" or "ema_dynamic_short_trade.py");
             StrategyParameterFormHint.Text = "加载策略后显示参数默认值和范围。";
             ClearSignalContext();
             SetStatus(message);
+            DrawChart();
     }
 
     private void ClearSignalContext()
@@ -1290,6 +1671,7 @@ public partial class MainWindow : Window
         ExportTradeSummaryButton.IsEnabled = false;
         LoadTradeDetailButton.IsEnabled = false;
         ResultViewText.Text = "当前为新研究配置";
+        UpdateTradingRules();
         DrawChart();
     }
 
@@ -1303,8 +1685,9 @@ public partial class MainWindow : Window
     {
         try
         {
-            var latest = new TradeRunStore(_store.RootDirectory).ReadMany<PositionRecord>(runId, "positions.jsonl").LastOrDefault();
-            return latest is null || latest.Quantity == 0 ? "空仓" : $"{latest.Direction} {latest.Quantity} 手";
+            // positions.jsonl contains only held bars and retains an old row after exit.
+            var latest = new TradeRunStore(_store.RootDirectory).ReadMany<FillRecord>(runId, "fills.jsonl").LastOrDefault();
+            return latest is null || latest.Action != "open" ? "空仓" : $"{latest.Direction} {latest.Quantity} 手";
         }
         catch { return "见持仓明细"; }
     }
@@ -1312,17 +1695,19 @@ public partial class MainWindow : Window
     private void UpdateTradeOverview(TradeRunRecord record)
     {
         var strategy = string.IsNullOrWhiteSpace(record.StrategyName) ? Path.GetFileName(record.StrategySnapshotPath) : record.StrategyName;
-        CurrentRunSummaryText.Text = $"当前 run：{record.RunId} · 状态：{record.Status} · {strategy}";
+        CurrentRunSummaryText.Text = $"当前 run：{record.RunId} · 状态：{record.Status} · {record.BacktestModeDisplayName} · {strategy}";
         OverviewText.Text = string.Join(Environment.NewLine,
             CurrentMarketSummary(),
+            $"回测口径：{record.BacktestModeDisplayName}" + (record.ResearchNotice is { } notice ? Environment.NewLine + notice : ""),
             $"区间：{record.StartInclusive:yyyy-MM-dd HH:mm} ～ {record.EndExclusive:yyyy-MM-dd HH:mm}",
             $"策略：{strategy}",
             $"净收益：{record.NetPnl}　收益率：{record.ReturnRate}%　期末权益：{record.FinalEquity}",
             $"最大回撤：{record.MaxDrawdown}　成交数：{record.FillCount}　已平仓数：{record.ClosedTradeCount}",
-            $"胜率：{(record.WinRate is null ? "不适用" : record.WinRate + "%")}　手续费：{record.TotalFees}　当前持仓：{CurrentPositionSummary(record.RunId)}");
+            $"胜率：{(record.WinRate is null ? "不适用" : record.WinRate.Value.ToString("0.00", CultureInfo.InvariantCulture) + "%")}　手续费：{record.TotalFees}　当前持仓：{CurrentPositionSummary(record.RunId)}");
         OverviewRerunButton.IsEnabled = !string.Equals(record.Status, "running", StringComparison.OrdinalIgnoreCase);
         OverviewExportButton.IsEnabled = true;
         ResultTabs.SelectedIndex = 0;
+        UpdateTradingRules();
     }
 
     private void UpdateSignalOverview(SignalReplayResult result)
@@ -1343,20 +1728,22 @@ public partial class MainWindow : Window
 
     private void OverviewEditStrategyButton_Click(object sender, RoutedEventArgs e)
     {
-        WorkflowTabs.SelectedIndex = 1;
-        if (_strategyDescriptor is not null)
+        if (!_contextGate.Wait(0)) { SetStatus("已有研究上下文任务运行中"); return; }
+        try
         {
-            StrategyParametersText.Text = JsonSerializer.Serialize(
-                _strategyDescriptor.Parameters.ToDictionary(pair => pair.Key, pair => pair.Value.Default),
-                new JsonSerializerOptions { WriteIndented = false });
-            BuildStrategyParameterForm();
-            SetDefaultReplayRange();
-            SetStatus("已返回策略页并恢复默认参数；旧 run 保持只读");
+            WorkflowTabs.SelectedIndex = 1;
+            if (_viewingRunId is not null) ClearSignalContext();
+            if (_strategyDescriptor is not null)
+            {
+                BuildStrategyParameterForm();
+                SetStatus("已返回策略页，保留当前参数、区间和交易设置；修改后回测会创建新 run");
+            }
+            else
+            {
+                SetStatus("已返回策略页，请加载策略后调整参数并回测");
+            }
         }
-        else
-        {
-            SetStatus("已返回策略页，可加载策略后使用默认参数重新回测；旧 run 保持只读");
-        }
+        finally { _contextGate.Release(); }
     }
 
     private void OverviewReloadDataButton_Click(object sender, RoutedEventArgs e)
@@ -1400,6 +1787,33 @@ public partial class MainWindow : Window
         EndExclusiveText.Text = (_bars[^1].Timestamp + PeriodDuration(_bars[^1].Period)).ToString("O", CultureInfo.InvariantCulture);
     }
 
+    private void UpdateBacktestRangeAvailability()
+    {
+        if (BacktestRangeAvailabilityText is null) return;
+        if (_bars.Count == 0)
+        {
+            BacktestRangeAvailabilityText.Text = "加载行情后显示可选日期范围。";
+            return;
+        }
+
+        var first = _bars[0].Timestamp;
+        var endExclusive = _bars[^1].Timestamp + PeriodDuration(_bars[^1].Period);
+        var text = $"数据范围：{first:yyyy/MM/dd HH:mm} 至 {endExclusive:yyyy/MM/dd HH:mm}（结束时刻不包含）";
+        try
+        {
+            var required = _strategyDescriptor is null ? 0 : SignalReplayRunner.RequiredWarmupBars(_strategyDescriptor, BuildParametersOrDefaults());
+            if (required >= _bars.Count)
+                text += $"\n当前策略需要 {required:N0} 根预热 K 线，现有 {_bars.Count:N0} 根，数据不足以形成有效回测。";
+            else
+                text += $"\n策略预热后推荐起点：{_bars[Math.Max(0, required)].Timestamp:yyyy/MM/dd HH:mm}；点击“填入推荐回测区间”即可自动对齐。";
+        }
+        catch
+        {
+            text += "\n填写有效策略参数后会显示推荐起点。";
+        }
+        BacktestRangeAvailabilityText.Text = text;
+    }
+
     private Dictionary<string, JsonElement> BuildParametersOrDefaults()
     {
         var result = new Dictionary<string, JsonElement>(StringComparer.Ordinal);
@@ -1419,8 +1833,7 @@ public partial class MainWindow : Window
         request = default!;
         error = "";
         if (_currentSnapshotId is null || _strategyDescriptor is null) { error = "请先加载快照和策略"; return false; }
-        if (!DateTimeOffset.TryParse(StartInclusiveText.Text, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var start) ||
-            !DateTimeOffset.TryParse(EndExclusiveText.Text, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var end)) { error = "正式起止时间格式无效"; return false; }
+        if (!TryReadBacktestRange(out var start, out var end, out error)) return false;
         try
         {
             var parameters = SignalReplayRunner.ValidateParameters(_strategyDescriptor, BuildParametersOrDefaults());
@@ -1520,41 +1933,53 @@ public partial class MainWindow : Window
     private async Task TradeReplayButtonCoreAsync()
     {
         if (_tradeReplayOperation is { IsCompleted: false }) return;
-        if (_viewingRunId is not null) { ClearSignalContext(); SetStatus("已退出只读结果视图，请确认新研究配置后再次开始"); return; }
+        if (_viewingRunId is not null)
+        {
+            ClearSignalContext();
+            SetStatus("已退出历史结果视图，正在按当前参数开始交易回测");
+        }
         if (_currentSnapshotId is null || _bars.Count == 0) { SetStatus("请先加载已发布数据快照"); return; }
         if (!await LoadStrategyAsync(resetParameters: false)) return;
         if (_strategyDescriptor is null || !string.Equals(_strategyDescriptor.Kind, "trade", StringComparison.OrdinalIgnoreCase)) { SetStatus("交易回放需要 kind=trade 策略"); return; }
-        if (!DateTimeOffset.TryParse(StartInclusiveText.Text, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var start) ||
-            !DateTimeOffset.TryParse(EndExclusiveText.Text, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var end)) { SetStatus("正式起止时间格式无效"); return; }
+        if (!TryReadBacktestRange(out var start, out var end, out var rangeError)) { SetStatus(rangeError); return; }
         try
         {
             var parameters = SignalReplayRunner.ValidateParameters(_strategyDescriptor, BuildParametersOrDefaults());
             var config = JsonSerializer.Deserialize<TradingConfig>(TradeConfigText.Text, new JsonSerializerOptions { PropertyNameCaseInsensitive = true, Converters = { new JsonStringEnumConverter() } }) ?? new TradingConfig();
+            // The visible capital field is authoritative when the user starts a replay;
+            // requiring a separate Apply click left runs using the prior JSON value.
+            config = config with { InitialEquity = decimal.Parse(TradeInitialEquityText.Text, CultureInfo.InvariantCulture) };
             config.Validate();
+            TradeConfigText.Text = JsonSerializer.Serialize(config, new JsonSerializerOptions { WriteIndented = false, Converters = { new JsonStringEnumConverter() } });
             _tradeReplayCancellation?.Dispose(); _tradeReplayCancellation = new CancellationTokenSource();
             TradeReplayButton.IsEnabled = false; CancelTradeReplayButton.IsEnabled = true; SetReplayControlsLocked(true);
             var workerPath = Path.Combine(AppContext.BaseDirectory, "worker", "qh_signal_worker.py");
-            var request = new TradeReplayRequest(_currentSnapshotId, _strategyDescriptor.StrategyPath, start, end, config, parameters, ExploreModeCheck.IsChecked == true);
+            var request = new TradeReplayRequest(_currentSnapshotId, _strategyDescriptor.StrategyPath, start, end, config, parameters,
+                ExploreModeCheck.IsChecked == true, MainContinuousResearch: _currentSnapshotInfo?.IsMainContinuous == true);
             var progress = new Progress<TradeReplayProgress>(item => SetStatus($"交易回放 {item.ProcessedRows}/{item.TotalRows}：{item.Stage}"));
             _tradeReplayOperation = Task.Run(() => new TradeReplayRunner(_store, workerPath).ReplayAsync(request, progress, _tradeReplayCancellation.Token), _tradeReplayCancellation.Token);
             var result = await _tradeReplayOperation;
             RunIdText.Text = result.RunId;
             var tradeStore = new TradeRunStore(_store.RootDirectory);
             var record = tradeStore.ReadRecord(result.RunId);
+            var riskEvents = await Task.Run(() => tradeStore.ReadMany<RiskEvent>(result.RunId, "risk-events.jsonl"));
+            var marginEvents = riskEvents.Where(item => item.Kind is "insufficient_funds" or "margin_exceeded").ToArray();
             _tradeRunDirectory = result.RunDirectory; _activeTradeRunId = result.RunId; _activeTradeRecord = record;
             _tradeFills = result.Fills;
-            RefreshTradeReport(result.ClosedTrades);
+            RefreshTradeReport(result.ClosedTrades, result.Intents);
             _tradeSignals = await Task.Run(() => tradeStore.ReadMany<SignalEvent>(result.RunId, "signals.jsonl"));
             _tradeEquity = await Task.Run(() => tradeStore.ReadEquitySample(result.RunId));
             TradeFillGrid.ItemsSource = _tradeFills;
             _allSignals = _tradeSignals; _displayedSignals = _tradeSignals; SignalGrid.ItemsSource = _displayedSignals;
             _lastSignalResult = new SignalReplayResult(record.RunId, record.Status, _tradeSignals, result.RunDirectory, record.ErrorMessage);
-            TradeResultText.Text = $"{record.Status}；意图 {record.FormalIntentCount}；成交 {record.FillCount}；已平 {record.ClosedTradeCount}{Environment.NewLine}毛利 {record.TotalGrossPnl}；手续费 {record.TotalFees}；净利 {record.NetPnl}；权益 {record.FinalEquity}；收益率 {record.ReturnRate}%；最大回撤 {record.MaxDrawdown}；胜率 {(record.WinRate is null ? "不适用" : record.WinRate + "%")}{Environment.NewLine}正式覆盖：{record.CoverageMessage}；原始 run：{record.RunId}";
+            var marginWarning = marginEvents.Length == 0 ? "" : $"{Environment.NewLine}保证金不足/保证金风险记录 {marginEvents.Length} 条；示例：{marginEvents[0].Message}";
+            TradeResultText.Text = $"{record.BacktestModeDisplayName}{Environment.NewLine}{record.Status}；意图 {record.FormalIntentCount}；成交 {record.FillCount}；已平 {record.ClosedTradeCount}{Environment.NewLine}毛利 {record.TotalGrossPnl}；手续费 {record.TotalFees}；净利 {record.NetPnl}；权益 {record.FinalEquity}；收益率 {record.ReturnRate}%；最大回撤 {record.MaxDrawdown}；胜率 {(record.WinRate is null ? "不适用" : record.WinRate + "%")}{Environment.NewLine}正式覆盖：{record.CoverageMessage}；原始 run：{record.RunId}{marginWarning}" + (record.ResearchNotice is { } researchNotice ? Environment.NewLine + researchNotice : "");
             TradeConfigText.Text = JsonSerializer.Serialize(record.Config, new JsonSerializerOptions { WriteIndented = false, Converters = { new JsonStringEnumConverter() } });
+            TradeInitialEquityText.Text = record.Config.InitialEquity.ToString(CultureInfo.InvariantCulture);
             UpdateTradeOverview(record);
             ExportTradeFillsButton.IsEnabled = true; ExportTradeEquityButton.IsEnabled = true; ExportTradeSummaryButton.IsEnabled = true; LoadTradeDetailButton.IsEnabled = true; ExportSignalsButton.IsEnabled = _tradeSignals.Count > 0;
             DrawEquityCurve(); DrawChart();
-            SetStatus(result.ErrorMessage is null ? "交易回放完成" : result.ErrorMessage);
+            SetStatus(result.ErrorMessage ?? (marginEvents.Length == 0 ? "交易回放完成" : $"回测完成，但有 {marginEvents.Length} 条保证金不足/风险记录"));
             AppendLog($"trade_run={result.RunId}; status={result.Status}; directory={result.RunDirectory}");
         }
         catch (OperationCanceledException) { SetStatus("交易回放已取消"); }
@@ -1611,6 +2036,7 @@ public partial class MainWindow : Window
     {
         ImportButton.IsEnabled = !locked;
         LoadSnapshotButton.IsEnabled = !locked;
+        LoadMainContinuousButton.IsEnabled = !locked;
         SnapshotCombo.IsEnabled = !locked;
         StrategyPeriodCombo.IsEnabled = !locked;
         StartBacktestButton.IsEnabled = !locked;
@@ -1628,6 +2054,7 @@ public partial class MainWindow : Window
         ApplyAdvancedParametersButton.IsEnabled = !locked;
         ApplyTradeFormButton.IsEnabled = !locked;
         TradeLotsText.IsEnabled = !locked;
+        TradeInitialEquityText.IsEnabled = !locked;
         TradeOpenFeeText.IsEnabled = !locked;
         TradeCloseFeeText.IsEnabled = !locked;
         TradeSlippageText.IsEnabled = !locked;
@@ -1635,6 +2062,7 @@ public partial class MainWindow : Window
         StrategyParametersText.IsEnabled = !locked;
         StartInclusiveText.IsEnabled = !locked;
         EndExclusiveText.IsEnabled = !locked;
+        BacktestRangeEditor.IsEnabled = !locked;
         ExploreModeCheck.IsEnabled = !locked;
         TradeConfigText.IsEnabled = !locked;
         ReplayButton.IsEnabled = !locked;
@@ -1672,6 +2100,7 @@ public partial class MainWindow : Window
                 if (_store.GetSnapshots().All(item => item.SnapshotId != tradeRecord.SnapshotId)) { SetStatus($"交易 run 绑定的快照不存在：{tradeRecord.SnapshotId}"); return; }
                 await LoadSnapshotAsync(tradeRecord.SnapshotId, clearSignalContext: true, setDefaultRange: false);
                 var fills = await Task.Run(() => tradeStore.ReadMany<FillRecord>(runId, "fills.jsonl"));
+                var intents = await Task.Run(() => tradeStore.ReadMany<TradeIntent>(runId, "intents.jsonl"));
                 var curve = await Task.Run(() => tradeStore.ReadEquitySample(runId));
                 _tradeSignals = await Task.Run(() => tradeStore.ReadMany<SignalEvent>(runId, "signals.jsonl"));
                 _restoringRunView = true;
@@ -1688,12 +2117,17 @@ public partial class MainWindow : Window
                 SyncStrategyPresetSelectionToDescriptor();
                 _tradeFills = fills; _tradeEquity = curve; _tradeRunDirectory = Path.Combine(tradeStore.RunsDirectory, runId); _activeTradeRunId = runId;
                 _activeTradeRecord = tradeRecord;
-                RefreshTradeReport(await Task.Run(() => tradeStore.ReadMany<ClosedTradeRecord>(runId, "closed-trades.jsonl")));
+                RefreshTradeReport(await Task.Run(() => tradeStore.ReadMany<ClosedTradeRecord>(runId, "closed-trades.jsonl")), intents);
                 TradeFillGrid.ItemsSource = _tradeFills; RunIdText.Text = runId; _viewingRunId = runId;
                 _allSignals = _tradeSignals; _displayedSignals = _tradeSignals; SignalGrid.ItemsSource = _displayedSignals;
                 _lastSignalResult = new SignalReplayResult(tradeRecord.RunId, tradeRecord.Status, _tradeSignals, _tradeRunDirectory, tradeRecord.ErrorMessage);
                 TradeConfigText.Text = JsonSerializer.Serialize(tradeRecord.Config, new JsonSerializerOptions { WriteIndented = false, Converters = { new JsonStringEnumConverter() } });
-                TradeResultText.Text = $"只读交易结果：快照 {tradeRecord.SnapshotId}；区间 {tradeRecord.StartInclusive:O}～{tradeRecord.EndExclusive:O}；探索={tradeRecord.Explore}；{tradeRecord.Status}；成交 {tradeRecord.FillCount}；净利 {tradeRecord.NetPnl}；权益 {tradeRecord.FinalEquity}；胜率 {(tradeRecord.WinRate is null ? "不适用" : tradeRecord.WinRate + "%")}";
+                TradeLotsText.Text = tradeRecord.Config.Lots.ToString(CultureInfo.InvariantCulture);
+                TradeInitialEquityText.Text = tradeRecord.Config.InitialEquity.ToString(CultureInfo.InvariantCulture);
+                TradeOpenFeeText.Text = tradeRecord.Config.OpenFee.ToString(CultureInfo.InvariantCulture);
+                TradeCloseFeeText.Text = tradeRecord.Config.OrdinaryCloseFee.ToString(CultureInfo.InvariantCulture);
+                TradeSlippageText.Text = tradeRecord.Config.SlippageTicks.ToString(CultureInfo.InvariantCulture);
+                TradeResultText.Text = $"{tradeRecord.BacktestModeDisplayName}{Environment.NewLine}只读交易结果：快照 {tradeRecord.SnapshotId}；区间 {tradeRecord.StartInclusive:O}～{tradeRecord.EndExclusive:O}；探索={tradeRecord.Explore}；{tradeRecord.Status}；成交 {tradeRecord.FillCount}；净利 {tradeRecord.NetPnl}；权益 {tradeRecord.FinalEquity}；胜率 {(tradeRecord.WinRate is null ? "不适用" : tradeRecord.WinRate + "%")}" + (tradeRecord.ResearchNotice is { } researchNotice ? Environment.NewLine + researchNotice : "");
                 UpdateTradeOverview(tradeRecord);
                 ResultViewText.Text = "只读交易结果：配置/区间/探索模式已从原 run 恢复；复制后可创建新 run";
                 ExportTradeFillsButton.IsEnabled = true; ExportTradeEquityButton.IsEnabled = true; ExportTradeSummaryButton.IsEnabled = true; LoadTradeDetailButton.IsEnabled = true; ExportSignalsButton.IsEnabled = _tradeSignals.Count > 0;
@@ -1701,6 +2135,7 @@ public partial class MainWindow : Window
                 _viewportCount = Math.Min(240, _bars.Count);
                 _viewportStart = Math.Max(0, _bars.Count - _viewportCount);
                 DrawChart();
+                RecordStartupEvent($"trade-run-opened: run={runId}, snapshot={_currentSnapshotId}, bars={_bars.Count}, label={CurrentDataOnStrategyText.Text}, parameters={StrategyParametersText.Text}, slippage={TradeSlippageText.Text}, ema={AverageLegendText.Text}, fills={TradeFillGrid.Items.Count}, chartChildren={ChartCanvas.Children.Count}, net={tradeRecord.NetPnl}, drawdown={tradeRecord.MaxDrawdown}, rules={TradingRulesContextText.Text}, preset={(StrategyPresetCombo.SelectedItem as ComboBoxItem)?.Tag}");
                 SetStatus($"已只读打开交易 run：{runId}"); return;
             }
             var store = new SignalRunStore(_store.RootDirectory);
@@ -2016,7 +2451,12 @@ public partial class MainWindow : Window
 
     private async Task LoadLatestSnapshotAsync()
     {
-        if (!await _contextGate.WaitAsync(0)) { SetStatus("已有研究上下文任务运行中"); return; }
+        if (!await _contextGate.WaitAsync(0))
+        {
+            SetStatus("启动加载行情失败：已有研究上下文任务运行中");
+            AppendLog("自动加载快照被已有研究上下文任务阻止");
+            return;
+        }
         try { await LoadLatestSnapshotCoreAsync(); }
         finally { _contextGate.Release(); }
     }
@@ -2027,17 +2467,35 @@ public partial class MainWindow : Window
         _queryCancellation?.Dispose();
         var queryCancellation = new CancellationTokenSource();
         _queryCancellation = queryCancellation;
-        var latestOperation = Task.Run(() => _store.GetLatestSnapshot(), queryCancellation.Token);
+        var preferredSnapshotId = ReadPreferredSnapshotId();
+        var latestOperation = Task.Run(() =>
+        {
+            var snapshots = _store.GetSnapshots();
+            return snapshots.FirstOrDefault(item => item.SnapshotId == preferredSnapshotId && IsRealMarketSnapshot(item))
+                ?? snapshots.FirstOrDefault(IsRealMarketSnapshot)
+                ?? snapshots.FirstOrDefault();
+        }, queryCancellation.Token);
         _queryOperation = latestOperation;
         try
         {
             var latest = await latestOperation;
             RefreshSnapshotList();
-            if (latest is null) return;
+            if (latest is null)
+            {
+                SetStatus($"未找到可用行情快照，当前数据目录：{_store.RootDirectory}");
+                AppendLog("自动加载快照未找到可用数据");
+                return;
+            }
+            AppendLog($"自动加载行情：{latest.DisplayName}；目录：{_store.RootDirectory}");
             await LoadSnapshotAsync(latest.SnapshotId);
             UpdateCurrentDataSelection();
         }
-        catch (Exception ex) { AppendLog("读取快照失败：" + ex.Message); }
+        catch (Exception ex)
+        {
+            SetStatus("启动加载快照失败：" + ex.Message);
+            AppendLog("读取快照失败：" + ex);
+            RecordStartupEvent("load-error: " + ex);
+        }
         finally
         {
             if (ReferenceEquals(_queryOperation, latestOperation)) _queryOperation = null;
@@ -2070,10 +2528,13 @@ public partial class MainWindow : Window
             var data = await queryOperation;
             _currentSnapshotId = snapshotId;
             _currentSnapshotInfo = _store.GetSnapshots().FirstOrDefault(item => item.SnapshotId == snapshotId);
+            if (_currentSnapshotInfo is { } loadedSnapshot && IsRealMarketSnapshot(loadedSnapshot))
+                RememberPreferredSnapshot(loadedSnapshot.SnapshotId);
             SnapshotCombo.SelectedItem = _currentSnapshotInfo;
             UpdateCurrentDataSelection();
             _bars = data.Bars;
             _indicators = data.Indicators;
+            UpdateBacktestRangeAvailability();
             if (_currentSnapshotInfo is null) DataStatusText.Text = $"{_bars.Count:N0} 根";
             if (setDefaultRange) SetDefaultReplayRange();
             _viewportStart = 0;
@@ -2095,6 +2556,31 @@ public partial class MainWindow : Window
                 _queryCancellation = null;
             }
         }
+    }
+
+    private string PreferredSnapshotPath => Path.Combine(_store.RootDirectory, "last-real-snapshot.txt");
+
+    private string? ReadPreferredSnapshotId()
+    {
+        try { return File.Exists(PreferredSnapshotPath) ? File.ReadAllText(PreferredSnapshotPath).Trim() : null; }
+        catch (Exception ex) { AppendLog("读取上次真实行情快照选择失败：" + ex.Message); return null; }
+    }
+
+    private void RememberPreferredSnapshot(string snapshotId)
+    {
+        try { File.WriteAllText(PreferredSnapshotPath, snapshotId, new UTF8Encoding(false)); }
+        catch (Exception ex) { AppendLog("保存真实行情快照选择失败：" + ex.Message); }
+    }
+
+    private static bool IsRealMarketSnapshot(SnapshotInfo snapshot)
+    {
+        var identity = (snapshot.Symbol + "/" + snapshot.Exchange).ToUpperInvariant();
+        var source = snapshot.SourcePath.Replace('\\', '/');
+        return !identity.Contains("TEST", StringComparison.Ordinal)
+            && !identity.Contains("SYNTH", StringComparison.Ordinal)
+            && !identity.Contains("SIMULATED", StringComparison.Ordinal)
+            && !source.Contains("/fixtures/", StringComparison.OrdinalIgnoreCase)
+            && !source.Contains("/fixture/", StringComparison.OrdinalIgnoreCase);
     }
 
     private void ShowQuality(ImportResult result)
@@ -2564,7 +3050,18 @@ public partial class MainWindow : Window
             await OpenRunButtonCoreAsync();
             var reopened = _activeTradeRecord;
             var reopenedFields = new { strategy = StrategyPathText.Text, parameters = StrategyParametersText.Text, start = StartInclusiveText.Text, end = EndExclusiveText.Text, explore = ExploreModeCheck.IsChecked == true, config = TradeConfigText.Text };
+            checks["restored_trade_form"] = reopened is not null &&
+                TradeInitialEquityText.Text == reopened.Config.InitialEquity.ToString(CultureInfo.InvariantCulture) &&
+                TradeLotsText.Text == reopened.Config.Lots.ToString(CultureInfo.InvariantCulture) &&
+                TradeOpenFeeText.Text == reopened.Config.OpenFee.ToString(CultureInfo.InvariantCulture) &&
+                TradeCloseFeeText.Text == reopened.Config.OrdinaryCloseFee.ToString(CultureInfo.InvariantCulture) &&
+                TradeSlippageText.Text == reopened.Config.SlippageTicks.ToString(CultureInfo.InvariantCulture);
             checks["readonly_reopen"] = new { bound_snapshot = reopened?.SnapshotId == f01Import.SnapshotId && _currentSnapshotId == f01Import.SnapshotId, chart_bound = _bars.Count == 3 && ChartCanvas.Children.Count > 10, start = reopened?.StartInclusive == start && reopenedFields.start == start.ToString("O", CultureInfo.InvariantCulture), end = reopened?.EndExclusive == end && reopenedFields.end == end.ToString("O", CultureInfo.InvariantCulture), explore = reopened?.Explore == false && !reopenedFields.explore, strategy = reopened is not null && Path.GetFileName(reopened.StrategySnapshotPath) == Path.GetFileName(reopenedFields.strategy), parameters = reopened is not null && JsonSerializer.Serialize(reopened.Parameters) == reopenedFields.parameters, config = reopened is not null && JsonSerializer.Deserialize<TradingConfig>(reopenedFields.config, new JsonSerializerOptions { PropertyNameCaseInsensitive = true, Converters = { new JsonStringEnumConverter() } }) is not null, read_only = _viewingRunId == tradeRunId };
+            OverviewEditStrategyButton_Click(this, new RoutedEventArgs());
+            checks["edit_strategy_preserves_config"] = StrategyPathText.Text == reopenedFields.strategy &&
+                StrategyParametersText.Text == reopenedFields.parameters && StartInclusiveText.Text == reopenedFields.start &&
+                EndExclusiveText.Text == reopenedFields.end && TradeConfigText.Text == reopenedFields.config &&
+                (ExploreModeCheck.IsChecked == true) == reopenedFields.explore;
             CopyTradeConfigButton_Click(this, new RoutedEventArgs());
             var copiedContext = _viewingRunId is null && _currentSnapshotId == f01Import.SnapshotId;
             var copiedFields = new { strategy = StrategyPathText.Text, parameters = StrategyParametersText.Text, start = StartInclusiveText.Text, end = EndExclusiveText.Text, explore = ExploreModeCheck.IsChecked == true, config = TradeConfigText.Text };
@@ -2796,6 +3293,8 @@ public partial class MainWindow : Window
                 exports = ((dynamic)checks["exports"]!).fills && ((dynamic)checks["exports"]!).equity && ((dynamic)checks["exports"]!).summary && ((dynamic)checks["exports"]!).signals,
                 rendered_tables = ((dynamic)checks["tables_rendered"]!).signals == ((dynamic)checks["trade_replay"]!).fills && ((dynamic)checks["tables_rendered"]!).fills == ((dynamic)checks["trade_replay"]!).fills && ((dynamic)checks["tables_rendered"]!).chart_children > 10 && ((dynamic)checks["tables_rendered"]!).equity_children > 0 && ((dynamic)checks["tables_rendered"]!).summary,
                 readonly_reopen = ((dynamic)checks["readonly_reopen"]!).bound_snapshot && ((dynamic)checks["readonly_reopen"]!).chart_bound && ((dynamic)checks["readonly_reopen"]!).start && ((dynamic)checks["readonly_reopen"]!).end && ((dynamic)checks["readonly_reopen"]!).explore && ((dynamic)checks["readonly_reopen"]!).strategy && ((dynamic)checks["readonly_reopen"]!).parameters && ((dynamic)checks["readonly_reopen"]!).config && ((dynamic)checks["readonly_reopen"]!).read_only,
+                restored_trade_form = checks["restored_trade_form"] is true,
+                edit_strategy_preserves_config = checks["edit_strategy_preserves_config"] is true,
                 copy_config = ((dynamic)checks["copy_config"]!).new_context && ((dynamic)checks["copy_config"]!).new_run && ((dynamic)checks["copy_config"]!).snapshot && ((dynamic)checks["copy_config"]!).strategy && ((dynamic)checks["copy_config"]!).parameters && ((dynamic)checks["copy_config"]!).start && ((dynamic)checks["copy_config"]!).end && ((dynamic)checks["copy_config"]!).explore && ((dynamic)checks["copy_config"]!).config && ((dynamic)checks["copy_config"]!).original_unchanged,
                 zero_trade = ((dynamic)checks["zero_trade"]!).status == "completed" && ((dynamic)checks["zero_trade"]!).fills == 0 && ((dynamic)checks["zero_trade"]!).win_rate_not_applicable,
                 last_bar_unfilled = ((dynamic)checks["last_bar_unfilled"]!).reason,
@@ -2808,7 +3307,7 @@ public partial class MainWindow : Window
                 result_rendered = ((dynamic)checks["rendered_result"]!).chart_children > 10 && ((dynamic)checks["rendered_result"]!).equity_children > 0 && ((dynamic)checks["rendered_result"]!).signal_rows == ((dynamic)checks["trade_replay"]!).fills && ((dynamic)checks["rendered_result"]!).fill_rows == ((dynamic)checks["trade_replay"]!).fills && ((dynamic)checks["rendered_result"]!).result_text && ((dynamic)checks["rendered_png"]!).has_visible_content && ((dynamic)checks["rendered_png"]!).chart_visible && ((dynamic)checks["rendered_png"]!).equity_visible && ((dynamic)checks["rendered_png"]!).result_visible
             };
             checks["passed_conditions"] = passedConditions;
-             checks["passed"] = passedConditions.required_controls && passedConditions.context_gate_non_reentrant && passedConditions.startup_ready && passedConditions.entry_collision && passedConditions.worker_exists && passedConditions.python_exists && passedConditions.signal_completed && passedConditions.signal_count && passedConditions.trade_completed && passedConditions.f01_business && passedConditions.equity_curve && passedConditions.signal_location && passedConditions.fill_location && passedConditions.zoom_path && passedConditions.ten_thousand_zoom && passedConditions.exports && passedConditions.rendered_tables && passedConditions.readonly_reopen && passedConditions.copy_config && passedConditions.zero_trade && passedConditions.last_bar_unfilled && passedConditions.cancel_observed && passedConditions.running_close_drain && passedConditions.cleanup && passedConditions.p02_five_runs && passedConditions.p03_dispatcher && passedConditions.p03_elapsed && passedConditions.result_rendered;
+             checks["passed"] = passedConditions.required_controls && passedConditions.context_gate_non_reentrant && passedConditions.startup_ready && passedConditions.entry_collision && passedConditions.worker_exists && passedConditions.python_exists && passedConditions.signal_completed && passedConditions.signal_count && passedConditions.trade_completed && passedConditions.f01_business && passedConditions.equity_curve && passedConditions.signal_location && passedConditions.fill_location && passedConditions.zoom_path && passedConditions.ten_thousand_zoom && passedConditions.exports && passedConditions.rendered_tables && passedConditions.readonly_reopen && passedConditions.restored_trade_form && passedConditions.edit_strategy_preserves_config && passedConditions.copy_config && passedConditions.zero_trade && passedConditions.last_bar_unfilled && passedConditions.cancel_observed && passedConditions.running_close_drain && passedConditions.cleanup && passedConditions.p02_five_runs && passedConditions.p03_dispatcher && passedConditions.p03_elapsed && passedConditions.result_rendered;
             checks["elapsed_ms"] = started.Elapsed.TotalMilliseconds;
         }
         catch (Exception ex)
